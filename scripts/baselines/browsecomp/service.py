@@ -5,6 +5,7 @@ The source loader reads the official BM25Searcher without importing optional
 dense-retriever modules. No query labels, qrels, model weights, or LLM APIs needed.
 """
 import argparse
+from collections import OrderedDict
 import hashlib
 import importlib.util
 import os
@@ -52,7 +53,29 @@ def create_app(searcher, tokenizer, *, source_root: Path, tokenizer_revision: st
     from pydantic import BaseModel, Field
 
     app = FastAPI(title="CALC shared official BrowseComp-Plus BM25")
-    lock = threading.RLock()
+    io_lock = threading.RLock()
+    tokenizer_lock = threading.Lock()
+    cache_lock = threading.Lock()
+    cache = OrderedDict()
+    key_locks = {}
+
+    def cached(key, build):
+        # The pinned corpus is immutable. Cache exact rendered results, never
+        # summaries, and coalesce identical concurrent requests.
+        with cache_lock:
+            key_lock = key_locks.setdefault(key, threading.Lock())
+        with key_lock:
+            with cache_lock:
+                if key in cache:
+                    cache.move_to_end(key)
+                    return cache[key]
+            value = build()
+            with cache_lock:
+                cache[key] = value
+                cache.move_to_end(key)
+                while len(cache) > 256:
+                    cache.popitem(last=False)
+            return value
 
     class SearchRequest(BaseModel):
         query: str = Field(min_length=1, max_length=20000)
@@ -61,9 +84,15 @@ def create_app(searcher, tokenizer, *, source_root: Path, tokenizer_revision: st
         docid: str = Field(min_length=1, max_length=1000)
 
     def truncate(text: str, cap: int):
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        return (tokenizer.decode(ids[:cap], skip_special_tokens=True) if len(ids) > cap else text,
-                len(ids) > cap)
+        with tokenizer_lock:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            return (tokenizer.decode(ids[:cap], skip_special_tokens=True) if len(ids) > cap else text,
+                    len(ids) > cap)
+
+    def render(raw, cap):
+        title, text = split_title(raw)
+        text, truncated = truncate(text, cap)
+        return title, text, truncated
 
     @app.get("/health")
     def health():
@@ -73,6 +102,7 @@ def create_app(searcher, tokenizer, *, source_root: Path, tokenizer_revision: st
             "tokenizer": "Qwen/Qwen3-0.6B", "tokenizer_revision": tokenizer_revision,
             "k": k, "snippet_max_tokens": snippet_tokens,
             "document_max_tokens": document_tokens,
+            "render_cache": "exact deterministic LRU, 256 entries",
             "tool_contract": {"search": "POST /retrieve", "get_document": "POST /document"},
             "source_file_sha256": {
                 name: hashlib.sha256((source_root / "searcher" / "searchers" / name).read_bytes()).hexdigest()
@@ -84,30 +114,38 @@ def create_app(searcher, tokenizer, *, source_root: Path, tokenizer_revision: st
     def retrieve(request: SearchRequest):
         if not request.query.strip():
             raise HTTPException(400, "query must not be blank")
-        with lock:
-            candidates = searcher.search(request.query, k)
+        def search():
+            with io_lock:
+                candidates = searcher.search(request.query, k)
             results = []
             for hit in candidates:
-                title, text = split_title(hit["text"])
-                snippet, _ = truncate(text, snippet_tokens)
+                title, snippet, _ = cached(("snippet", str(hit["docid"])),
+                                           lambda hit=hit: render(hit["text"], snippet_tokens))
                 results.append({"docid": str(hit["docid"]), "document": {"title": title, "text": snippet}})
-        return {"result": results}
+            return {"result": results}
+        return cached(("search", request.query), search)
 
     @app.post("/document")
     def document(request: DocumentRequest):
-        with lock:
-            found = searcher.get_document(request.docid)
+        def read():
+            with io_lock:
+                found = searcher.get_document(request.docid)
             if found is None:
                 raise HTTPException(404, "document not found")
-            title, text = split_title(found["text"])
-            text, truncated = truncate(text, document_tokens)
-        return {"document": {"docid": str(found["docid"]), "title": title, "text": text},
-                "truncated": truncated}
+            title, text, truncated = render(found["text"], document_tokens)
+            return {"document": {"docid": str(found["docid"]), "title": title, "text": text},
+                    "truncated": truncated}
+        return cached(("document", request.docid), read)
 
     return app
 
 
 def main():
+    import faulthandler
+    import signal
+    faulthandler.enable()
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, default=Path("/opt/calc/upstreams/BrowseComp-Plus"))
     parser.add_argument("--index-path", type=Path, default=EXP_ROOT / "bench" / "browsecomp-plus" / "indexes" / "bm25")
