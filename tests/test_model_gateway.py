@@ -11,9 +11,9 @@ import pytest
 from calc.adapters import model_gateway
 
 
-def send(url, *, key="local-token", stream=False):
+def send(url, *, key="local-token", stream=False, extra=None):
     request = Request(url, data=json.dumps({"model": "deepseek-flash", "messages": [
-        {"role": "user", "content": "Test request"}], "stream": stream}).encode(),
+        {"role": "user", "content": "Test request"}], "stream": stream, **(extra or {})}).encode(),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
     try:
         response = build_opener(ProxyHandler({})).open(request, timeout=5)
@@ -180,3 +180,71 @@ def test_gateway_bounded_parallelism_and_per_task_budget(monkeypatch, tmp_path, 
     assert calls == (1 if same_task else 3)
     assert sum(item["requests"] for item in gateway.counts.values()) == calls
     assert all(item["tokens"] == 13 and item["missing_usage"] == 0 for item in gateway.counts.values())
+
+
+def test_native_gateway_preserves_decoding_parallelism_and_unknown_usage(monkeypatch, tmp_path):
+    release, reached = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    count = 0
+
+    def upstream(request):
+        nonlocal count
+        body = json.loads(request.content)
+        assert body["max_tokens"] == 65536 and body["temperature"] == 1.0
+        assert "reasoning_effort" not in body  # No policy injected by the meter.
+        with lock:
+            count += 1
+            index = count
+            if count == 2:
+                reached.set()
+        assert release.wait(3)
+        return httpx.Response(200, json={"choices": [], **({} if index == 1 else {"usage": {"total_tokens": 13}})})
+
+    real_client = httpx.Client
+    monkeypatch.setattr(model_gateway.httpx, "Client", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(upstream), **kwargs))
+    gateway = model_gateway.Gateway(tmp_path, "http://upstream.test", "provider", "local-token",
+                                    concurrency=2, requests=1, tokens=1, native_settings=True)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), gateway.handler())
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    url = f"http://127.0.0.1:{server.server_port}/v1/native/same/chat/completions"
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            futures = [pool.submit(send, url, extra={"max_tokens": 65536, "temperature": 1.0}) for _ in range(2)]
+            try:
+                assert reached.wait(2), "Native same-task workflow calls must overlap"
+            finally:
+                release.set()
+            assert all(f.result()[0] == 200 for f in futures)
+        assert send(url, extra={"max_tokens": 65536, "temperature": 1.0})[0] == 200
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)
+    assert gateway.counts["native/same"] == {"requests": 3, "tokens": 26, "missing_usage": 1}
+
+
+def test_partial_nonstream_response_becomes_valid_502_not_broken_200(monkeypatch, tmp_path):
+    class BrokenStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'{"choices":['
+            raise httpx.RemoteProtocolError("Truncated upstream")
+
+    real_client = httpx.Client
+    monkeypatch.setattr(model_gateway.httpx, "Client", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, stream=BrokenStream())), **kwargs))
+    gateway = model_gateway.Gateway(tmp_path, "http://upstream.test", "provider", "local-token")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), gateway.handler())
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        status, body = send(f"http://127.0.0.1:{server.server_port}/v1/main/q1/chat/completions")
+        assert status == 502 and "error" in json.loads(body)
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)
+    record = json.loads(next(tmp_path.glob("main/q1/*.json")).read_text())
+    assert record["error_type"] == "RemoteProtocolError" and not record["usage"]

@@ -15,6 +15,52 @@ def completion(message, *, finish_reason="stop", usage=None):
     })
 
 
+def test_main_truncation_gets_a_submission_turn_instead_of_immediate_failure():
+    bodies = []
+
+    def handle(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        if len(bodies) == 1:
+            return completion({"content": "Partial reasoning", "reasoning_content": "Working"}, finish_reason="length")
+        assert "tools" not in body
+        assert "Submit your best final answer" in body["messages"][-1]["content"]
+        return completion({"content": "Exact Answer: Test answer"})
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http:
+        result = run_task(BrowseCompTask("finish", "Test question"),
+                          {"run": {"mode": "main", "main_max_steps": 5, "max_model_requests": 0,
+                                   "finalize_on_limit": True}},
+                          OpenAICompatibleClient("http://model.test/v1", "test", client=http),
+                          BrowseCompRetriever("http://retriever.test", client=http))
+    assert result.official["status"] == "completed" and len(result.calls) == 2
+
+
+def test_raw_history_projection_handles_pathological_document_title():
+    bodies = []
+
+    def handle(request):
+        if request.url.host == "retriever.test":
+            return httpx.Response(200, json={"result": [{"docid": "large-title", "document": {
+                "title": "X" * 200000, "text": "Actual document text"}}]})
+        body = json.loads(request.content)
+        bodies.append(body)
+        if len(bodies) == 1:
+            return completion(tool_call(), finish_reason="tool_calls")
+        assert "large-title" in json.dumps(body)
+        assert "X" * 1000 not in json.dumps(body)
+        return completion({"content": "Exact Answer: Fixture"})
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http:
+        result = run_task(BrowseCompTask("titles", "Find a source"),
+                          {"run": {"mode": "main", "main_history_mode": "raw", "model_input_budget": 2000}},
+                          OpenAICompatibleClient("http://model.test/v1", "test", client=http),
+                          BrowseCompRetriever("http://retriever.test", client=http))
+    assert result.official["status"] == "completed"
+    assert any("X" * 1000 in m.get("content", "") for m in result.state.agents["main"].history
+               if m.get("role") == "tool")
+
+
 def tool_call(query="candidate evidence", call_id="call-1"):
     return {"content": None, "tool_calls": [{"id": call_id, "type": "function", "function": {
         "name": "search", "arguments": json.dumps({"query": query}),

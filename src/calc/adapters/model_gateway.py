@@ -7,6 +7,7 @@ provider responses are recorded, but authentication headers never are.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -52,15 +53,16 @@ def response_usage(raw: bytes, streaming: bool) -> dict[str, Any]:
 class Gateway:
     def __init__(self, root: Path, upstream: str, api_key: str, local_key: str,
                  *, requests: int = 100, tokens: int = 160000, concurrency: int = 1,
-                 output_tokens: int = 4096) -> None:
+                 output_tokens: int = 4096, native_settings: bool = False) -> None:
         if min(concurrency, output_tokens) < 1:
             raise ValueError("concurrency and output_tokens must be positive")
         self.root, self.upstream = root, upstream.rstrip("/")
         self.api_key, self.local_key = api_key, local_key
-        self.request_limit, self.token_limit = requests, tokens
+        self.native_settings = native_settings
+        self.request_limit, self.token_limit = (0, 0) if native_settings else (requests, tokens)
         self.lock = threading.Lock()
         self.concurrency = concurrency
-        self.output_limit = output_tokens
+        self.output_limit = None if native_settings else output_tokens
         self.slots = threading.BoundedSemaphore(concurrency)
         self.task_locks: dict[str, Any] = {}
         self.counts: dict[str, dict[str, int]] = {}
@@ -73,6 +75,8 @@ class Gateway:
     def task_lock(self, key: str):
         # Keep one in-flight request per episode so budget reservations and
         # unknown usage remain exact, while independent episodes can overlap.
+        if self.native_settings:
+            return nullcontext()
         with self.lock:
             return self.task_locks.setdefault(key, threading.Lock())
 
@@ -103,7 +107,8 @@ class Gateway:
             def do_GET(self):
                 if self.path == "/health":
                     self.reply(200, {"status": "ok", "max_in_flight_model_requests": gateway.concurrency,
-                                     "max_in_flight_requests_per_task": 1,
+                                     "mode": "native_passthrough" if gateway.native_settings else "bounded",
+                                     "max_in_flight_requests_per_task": None if gateway.native_settings else 1,
                                      "max_output_tokens": gateway.output_limit,
                                      "request_limit_per_task": gateway.request_limit,
                                      "observed_token_stop_threshold": gateway.token_limit})
@@ -129,22 +134,24 @@ class Gateway:
                     self.reply(400, {"error": {"message": "Invalid model request"}})
                     return
                 body["model"] = "deepseek-flash"
-                body["thinking"] = {"type": "enabled"}
-                body["reasoning_effort"] = "high"
-                body.pop("temperature", None)  # Ignored by the provider in thinking mode.
-                requested_output = body.pop("max_completion_tokens", body.get("max_tokens")) or gateway.output_limit
-                body["max_tokens"] = min(int(requested_output), gateway.output_limit)
+                if not gateway.native_settings:
+                    body["thinking"] = {"type": "enabled"}
+                    body["reasoning_effort"] = "high"
+                    body.pop("temperature", None)  # Ignored by the provider in thinking mode.
+                    requested_output = body.pop("max_completion_tokens", body.get("max_tokens")) or gateway.output_limit
+                    body["max_tokens"] = min(int(requested_output), gateway.output_limit)
                 streaming = bool(body.get("stream", False))
                 if streaming:
                     body["stream_options"] = {**(body.get("stream_options") or {}), "include_usage": True}
                 queued = perf_counter()
                 with gateway.task_lock(task_key), gateway.slots:
                     previous = gateway.counts.get(task_key, {"requests": 0, "tokens": 0, "missing_usage": 0})
-                    if previous["missing_usage"]:
+                    if not gateway.native_settings and previous["missing_usage"]:
                         self.reply(409, {"error": {"type": "accounting_incomplete",
                                                   "message": "An earlier submitted request has unknown usage"}})
                         return
-                    if previous["requests"] >= gateway.request_limit or previous["tokens"] >= gateway.token_limit:
+                    if ((gateway.request_limit and previous["requests"] >= gateway.request_limit)
+                            or (gateway.token_limit and previous["tokens"] >= gateway.token_limit)):
                         self.reply(402, {"error": {"type": "task_budget_exhausted",
                                                   "message": "Shared task budget exhausted"}})
                         return
@@ -153,35 +160,49 @@ class Gateway:
                     record_path = gateway.root / run_id / task_id / f"{uuid4().hex}.json"
                     # Persist and reserve before submitting any potentially billable request.
                     persist_record(record_path, record)
-                    gateway.account(task_key, {})
+                    with gateway.lock:
+                        gateway.account(task_key, {})
                     started = perf_counter()
                     raw = bytearray()
                     connected = True
                     try:
-                        with httpx.Client(timeout=300) as client:
+                        with httpx.Client(timeout=600) as client:
                             with client.stream("POST", f"{gateway.upstream}/chat/completions", json=body,
                                                headers={"Authorization": f"Bearer {gateway.api_key}"}) as response:
                                 record["http_status"] = response.status_code
-                                try:
-                                    self.send_response(response.status_code)
-                                    self.send_header("Content-Type", response.headers.get("content-type", "application/json"))
-                                    self.send_header("Connection", "close")
-                                    self.end_headers()
-                                except OSError:
-                                    # A client can time out while queued. Still drain the provider
-                                    # response so its billable usage is not discarded.
-                                    connected = False
+                                if streaming:
+                                    try:
+                                        self.send_response(response.status_code)
+                                        self.send_header("Content-Type", response.headers.get("content-type", "application/json"))
+                                        self.send_header("Connection", "close")
+                                        self.end_headers()
+                                    except OSError:
+                                        connected = False
                                 for chunk in response.iter_bytes():
                                     raw.extend(chunk)
-                                    if connected:
+                                    if connected and streaming:
                                         try:
                                             self.wfile.write(chunk)
                                             self.wfile.flush()
                                         except OSError:
                                             connected = False
-                    except httpx.HTTPError as exc:
+                                if not streaming:
+                                    # Never publish HTTP 200 plus half a JSON body:
+                                    # a truncated upstream response must be a transport
+                                    # failure that native SDK retry policies can recognize.
+                                    json.loads(raw)
+                                    try:
+                                        self.send_response(response.status_code)
+                                        self.send_header("Content-Type", "application/json")
+                                        self.send_header("Content-Length", str(len(raw)))
+                                        self.end_headers()
+                                        self.wfile.write(raw)
+                                    except OSError:
+                                        connected = False
+                    except (httpx.HTTPError, ValueError) as exc:
                         record["error_type"] = type(exc).__name__
-                        if not raw and "http_status" not in record:
+                        if not streaming or (not raw and "http_status" not in record):
+                            record["forwarded_status"] = 502
                             try:
                                 self.reply(502, {"error": {"message": "Upstream transport error"}})
                             except OSError:
@@ -193,10 +214,11 @@ class Gateway:
                         record["usage"] = response_usage(bytes(raw), streaming)
                         record["state"] = "finished"
                         # Replace the in-flight reservation without double-counting the request.
-                        item = gateway.counts[task_key]
-                        item["requests"] -= 1
-                        item["missing_usage"] -= 1
-                        gateway.account(task_key, record["usage"])
+                        with gateway.lock:
+                            item = gateway.counts[task_key]
+                            item["requests"] -= 1
+                            item["missing_usage"] -= 1
+                            gateway.account(task_key, record["usage"])
                         persist_record(record_path, record)
 
         return Handler
@@ -211,11 +233,13 @@ def main() -> None:
     parser.add_argument("--request-limit", type=int, default=100)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--max-output-tokens", type=int, default=4096)
+    parser.add_argument("--native-settings", action="store_true",
+                        help="Meter only: preserve native decoding, caps and within-task concurrency")
     args = parser.parse_args()
     gateway = Gateway(args.log_dir, os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
                       os.environ["DEEPSEEK_API_KEY"], os.environ["CALC_GATEWAY_KEY"],
                       requests=args.request_limit, tokens=args.token_limit, concurrency=args.concurrency,
-                      output_tokens=args.max_output_tokens)
+                      output_tokens=args.max_output_tokens, native_settings=args.native_settings)
     ThreadingHTTPServer((args.host, args.port), gateway.handler()).serve_forever()
 
 

@@ -25,8 +25,8 @@ exec "$ENVROOT/bin/harbor" trial start -p "$TASK" -e docker \
   --agent-kwarg context_budget_tokens=28672 \
   --agent-kwarg context_budget_reserve_tokens=2048 \
   --agent-kwarg "max_tokens=${CALC_MAX_OUTPUT_TOKENS:-4096}" --agent-kwarg max_steps=500 \
-  --agent-kwarg lm_call_cap=100 --agent-kwarg cost_metric=usd \
+  --agent-kwarg "lm_call_cap=${CALC_CLM_CALL_CAP:-100}" --agent-kwarg cost_metric=usd \
   --agent-kwarg persistent_bash=true --agent-kwarg observation_max_chars=60000 \
   --agent-kwarg persistent_nudge_ratio=0.9 --agent-kwarg max_num_retry_on_limit=6 \
-  --agent-kwarg task_template=open_problems --agent-kwarg max_transport_attempts=1 \
+  --agent-kwarg task_template=open_problems --agent-kwarg "max_transport_attempts=${CALC_TRANSPORT_ATTEMPTS:-1}" \
   --trials-dir "${CLM_TRIALS_DIR:-$ROOT/calc_port/trials}" "$@"

@@ -24,6 +24,7 @@ def main():
     parser.add_argument("--run-tag", help="Fresh experiment tag; gateway run ID becomes <tag>-dynaflow")
     parser.add_argument("--limit", type=int, help="Take the first N tasks in frozen input order")
     parser.add_argument("--max-output", type=int, default=4096)
+    parser.add_argument("--native-settings", action="store_true")
     parser.add_argument("--deadline", type=int, default=1200, help="Native wall-clock limit in seconds; 0 disables it")
     parser.add_argument("--max-model-requests", type=int, default=100, help="Gateway-enforced shared request budget metadata")
     parser.add_argument("--observed-token-stop-threshold", type=int, default=160000,
@@ -39,7 +40,7 @@ def main():
     gateway_run_id = f"{args.run_tag}-dynaflow" if args.run_tag else "dynaflow"
     if args.out.exists():
         raise ValueError("output exists; choose a new immutable preparation directory")
-    if min(args.max_output, args.max_model_requests, args.observed_token_stop_threshold) <= 0 or args.deadline < 0:
+    if args.max_output <= 0 or min(args.max_model_requests, args.observed_token_stop_threshold, args.deadline) < 0:
         raise ValueError("output/request/token budgets must be positive and deadline nonnegative")
     args.out.mkdir(parents=True)
     shards = []
@@ -53,6 +54,9 @@ def main():
         task = {**row, "number": 1}
         endpoint = args.gateway.rstrip("/") + "/v1/" + gateway_run_id + "/" + quote(qid, safe="")
         cfg = config(args.max_output, args.deadline or None, endpoint)
+        if args.native_settings:
+            cfg["parameters"].update(temperature=1.0, top_p=0.95)
+            cfg.update(seed=42, seed_strategy="fixed")
         for name, value in [("questions.json", [task]), ("config.json", cfg)]:
             (inputs / name).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         run_dir = shard / "run"
@@ -72,6 +76,7 @@ def main():
                 "shared_budget": {"max_model_requests": args.max_model_requests,
                                   "observed_token_stop_threshold": args.observed_token_stop_threshold,
                                   "enforced_by": "common model gateway, not native DynaFlow"},
+                "native_settings": args.native_settings,
                 "native_question_deadline_seconds": args.deadline or None,
                 "upstream_commit": "7451639d197ef844b4157cf40eadac68e9eba8ca",
                 "node_image": "node:24.14.0-bookworm-slim",

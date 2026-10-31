@@ -12,7 +12,7 @@ try {
         $hmac.ComputeHash($utf8.GetBytes('CALC-local-model-gateway-v0-20261031'))).ToLowerInvariant()
 } finally { $hmac.Dispose() }
 $forward = @('CALC_GATEWAY_KEY','CALC_MAX_OUTPUT_TOKENS')
-if ($StartGateway) { $forward += @('DEEPSEEK_API_KEY','DEEPSEEK_BASE_URL','CALC_TOKEN_LIMIT','CALC_MODEL_CONCURRENCY') }
+if ($StartGateway) { $forward += @('DEEPSEEK_API_KEY','DEEPSEEK_BASE_URL','CALC_TOKEN_LIMIT','CALC_MODEL_CONCURRENCY','CALC_NATIVE_SETTINGS') }
 $existing = @($env:WSLENV -split ':' | Where-Object { $_ -and $_ -notmatch '^(DEEPSEEK_API_KEY|DEEPSEEK_BASE_URL|CALC_GATEWAY_KEY)(/.*)?$' })
 $env:WSLENV = ($existing + $forward) -join ':'
 if ($StartGateway) {

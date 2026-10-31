@@ -201,8 +201,8 @@ def run_task(
     controller_interval = int(options.get("controller_interval", 1))
     raw_main_history = options.get("main_history_mode") == "raw"
     model_input_budget = int(options.get("model_input_budget", 32768))
-    if min(main_steps, worker_steps, max_requests, max_output, context_budget,
-           main_context_budget, controller_interval) < 1:
+    if min(main_steps, worker_steps, max_output, context_budget,
+           main_context_budget, controller_interval) < 1 or max_requests < 0:
         raise ValueError("step, request, output and context budgets must be positive")
     state = TaskState(task.query_id, task.query)
     state.add_work(WorkItem("answer", task.query, "main"))
@@ -239,8 +239,9 @@ def run_task(
         packet = compiler.compile(state, agent_id, budget=context_budget if worker else main_context_budget,
                                   mode="recent" if worker else ("state" if raw_main_history else "full"))
         last_round: list[dict[str, Any]] = []
-        for _ in range(steps):
-            if len(run.calls) >= max_requests:
+        force_finalize = False
+        for step_index in range(steps):
+            if max_requests and len(run.calls) >= max_requests:
                 return "", "max_model_requests"
             token_limit = options.get("max_total_tokens")
             if token_limit and aggregate_usage(run.calls)["total_tokens"] >= int(token_limit):
@@ -278,7 +279,7 @@ def run_task(
                                 continue
                             value = json.loads(message["content"])
                             rows = value if isinstance(value, list) else [value]
-                            sources = [{key: row[key] for key in ("docid", "evidence_id", "title") if key in row}
+                            sources = [{key: row[key] for key in ("docid", "evidence_id") if key in row}
                                        for row in rows if isinstance(row, dict)]
                             content = json.dumps({"observation_projected": True, "sources": sources,
                                                   "recovery": MEMORY_HINT}, ensure_ascii=False)
@@ -292,24 +293,41 @@ def run_task(
                     else:
                         break
                 messages = prefix + [message for group in kept for message in group]
+            finalizing = bool(options.get("finalize_on_limit")) and not worker and (
+                force_finalize or step_index >= max(0, steps - 3))
+            if finalizing:
+                messages.append({"role": "user", "content":
+                    "The research phase has ended. Submit your best final answer to the original question now, "
+                    "using the evidence already collected. Give the answer and brief supporting evidence; "
+                    "if uncertain, say so explicitly. Do not request more tools or return an investigation plan."})
             state.record("context_prepared", agent_id=agent_id, packet_mode=packet.mode,
                          estimated_tokens=packet.estimated_tokens,
                          omitted_evidence_ids=packet.omitted_evidence_ids)
             before = perf_counter()
-            try:
-                response = llm.complete(messages, tools=TOOLS, max_output_tokens=max_output)
-            except KeyboardInterrupt:
-                run.calls.append({"agent_id": agent_id, "elapsed_seconds": perf_counter() - before,
-                                  "usage": {"reported": False}, "error_type": "KeyboardInterrupt",
-                                  "messages": messages})
-                raise
-            except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-                run.calls.append({"agent_id": agent_id, "elapsed_seconds": perf_counter() - before,
-                                  "usage": {"reported": False}, "error_type": type(exc).__name__,
-                                  "messages": messages})
-                # Do not serialize headers, API keys, or provider response bodies.
-                run.error = f"model request failed: {type(exc).__name__}"
-                return "", "model_error"
+            attempts = max(1, int(options.get("transport_attempts", 1)))
+            for attempt in range(attempts):
+                try:
+                    response = llm.complete(messages, tools=None if finalizing else TOOLS, max_output_tokens=max_output)
+                    break
+                except KeyboardInterrupt:
+                    run.calls.append({"agent_id": agent_id, "elapsed_seconds": perf_counter() - before,
+                                      "usage": {"reported": False}, "error_type": "KeyboardInterrupt",
+                                      "messages": messages})
+                    raise
+                except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                    run.calls.append({"agent_id": agent_id, "elapsed_seconds": perf_counter() - before,
+                                      "usage": {"reported": False}, "error_type": type(exc).__name__,
+                                      "messages": messages})
+                    status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+                    transient = isinstance(exc, httpx.TransportError) or status_code == 429 or (
+                        status_code is not None and status_code >= 500)
+                    if transient and attempt + 1 < attempts:
+                        import time
+                        time.sleep(min(2 ** attempt, 8))
+                        continue
+                    # No headers, keys, or provider response bodies in summaries.
+                    run.error = f"model request failed: {type(exc).__name__}"
+                    return "", "model_error"
             run.calls.append({"agent_id": agent_id, "messages": messages,
                               "response": response.message, "finish_reason": response.finish_reason,
                               "usage": response.usage.to_dict(), "elapsed_seconds": response.elapsed_seconds})
@@ -320,6 +338,13 @@ def run_task(
             agent.step_count += 1
             calls = message.get("tool_calls") or []
             if response.finish_reason in {"length", "content_filter"}:
+                if response.finish_reason == "length" and options.get("finalize_on_limit") and not worker:
+                    # Preserve the generated reasoning/text but never execute an
+                    # incomplete tool call. The next ordinary turn is for submission.
+                    message.pop("tool_calls", None)
+                    force_finalize = True
+                    state.record("generation_truncated", agent_id=agent_id, action="finalize_next_turn")
+                    continue
                 return "", "max_tokens" if response.finish_reason == "length" else "content_filter"
             if not calls:
                 if response.finish_reason != "stop":

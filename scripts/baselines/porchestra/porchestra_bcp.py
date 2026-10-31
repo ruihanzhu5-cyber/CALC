@@ -74,19 +74,19 @@ def make_environment(BasicInfo, Environment):
                                  "### " + tool["name"] + "\n" + tool["description"] + "\nParameters: "
                                  + json.dumps(tool["parameters"]) for tool in TOOLS), max_steps=self.session_steps,
                              meta_data={"original_question": self.original_question, "benchmark": "BrowseComp-Plus",
-                                        "tool_calls_used": self.tool_calls, "max_tool_calls": self.max_tool_calls})
+                                        "tool_calls_used": self.tool_calls, "max_tool_calls": self.max_tool_calls or None})
 
         def reset(self, seed=None):
             # Native delegate calls reset for every new session. BCP retrieval
             # is stateless, so only its initial observation resets. The task's
             # total tool budget must never reset when a worker is replaced.
             return {"instruction": self.instruction, "tool_calls_used": self.tool_calls,
-                    "remaining_tool_calls": max(0, self.max_tool_calls - self.tool_calls)}
+                    "remaining_tool_calls": max(0, self.max_tool_calls - self.tool_calls) if self.max_tool_calls else None}
 
         def step(self, action):
             name = action.get("action")
             params = action.get("params") or {}
-            if self.tool_calls >= self.max_tool_calls:
+            if self.max_tool_calls and self.tool_calls >= self.max_tool_calls:
                 return {"error": "task retrieval tool budget exhausted"}, 0.0, True, {"budget_exhausted": True}
             self.tool_calls += 1
             before = time.monotonic()
@@ -104,7 +104,7 @@ def make_environment(BasicInfo, Environment):
             info = {"tool_calls_used": self.tool_calls, "tool_elapsed_seconds": time.monotonic() - before}
             if self.trace:
                 self.trace.append("bcp_tool", action=action, observation=observation, **info)
-            return observation, 0.0, self.tool_calls >= self.max_tool_calls, info
+            return observation, 0.0, bool(self.max_tool_calls and self.tool_calls >= self.max_tool_calls), info
 
     return BCPEnvironment
 
@@ -138,7 +138,7 @@ async def run_task(args, task):
     if not gateway_key:
         raise RuntimeError("CALC_GATEWAY_KEY is required for the local metering proxy; use invoke_wsl_experiment.ps1 to inject it.")
     model_config = {"model": args.model, "base_url": base_url, "api_key": gateway_key,
-                    "temperature": args.temperature, "top_p": 1, "timeout": 300}
+                    "temperature": args.temperature, "top_p": 1}
     LLMsConfig._default_config = LLMsConfig({args.model: model_config})
     llm = create_llm_instance(model_config)
     env_class = make_environment(BasicInfo, Environment)
