@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -31,10 +32,10 @@ def write_json(path: Path, value) -> None:
 
 
 def commands(root: Path, method: str, task: dict, output: Path,
-             token_limit: int = 160000) -> tuple[list[str], dict[str, str]]:
+             token_limit: int = 160000, run_tag: str = "first20-flash-v2") -> tuple[list[str], dict[str, str]]:
     qid = str(task["query_id"])
     python = "/opt/calc/envs/calc/bin/python"
-    base = f"http://127.0.0.1:8767/v1/first20-{method}-v2/{qid}"
+    base = f"http://127.0.0.1:8767/v1/{run_tag}-{method}/{qid}"
     env = os.environ.copy()
     env.pop("DEEPSEEK_API_KEY", None)
     env["NO_PROXY"] = env["no_proxy"] = "localhost,127.0.0.1,::1,host.docker.internal"
@@ -52,7 +53,7 @@ def commands(root: Path, method: str, task: dict, output: Path,
                     "context_budget": 8192, "main_context_budget": 28672, "controller_interval": 3,
                     "main_history_mode": "raw", "model_input_budget": 32768, "max_total_tokens": token_limit},
         }
-        config_path = root / "configs/first20" / method / f"{qid}.json"
+        config_path = root / "configs" / run_tag / method / f"{qid}.json"
         write_json(config_path, config)
         return [python, "-m", "calc.cli", "run-browsecomp", "--config", str(config_path)], env
     if method == "porchestra":
@@ -66,11 +67,14 @@ def commands(root: Path, method: str, task: dict, output: Path,
         manifest = json.loads((port / "tasks_first20/manifest.json").read_text())
         row = next(row for row in manifest["tasks"] if str(row["query_id"]) == qid)
         env["CLM_API_BASE"] = base
-        env["CLM_TRIALS_DIR"] = str(root / "runs/first20-flash-v2/clm-native")
+        env["CLM_TRIALS_DIR"] = str(root / "runs" / run_tag / "clm-native")
         return ["bash", str(root / "code/CALC/scripts/baselines/clm/run_clm_bcp.sh"),
                 str(port / "tasks_first20" / row["directory"]),
-                "--trial-name", f"first20-clm-v2-{qid}"], env
-    manifest = json.loads((root / "runs/dynaflow-flash-first20-prepared/shards.json").read_text())
+                "--trial-name", f"{run_tag}-clm-{qid}"], env
+    manifest_path = root / "runs" / run_tag / "dynaflow-prepared/shards.json"
+    if run_tag == "first20-flash-v2":
+        manifest_path = root / "runs/dynaflow-flash-first20-prepared/shards.json"
+    manifest = json.loads(manifest_path.read_text())
     row = next(row for row in manifest["shards"] if str(row["query_id"]) == qid)
     # The author-prepared, per-task config already names /v1/dynaflow/<qid>.
     command = [part.replace("/mnt/d/CALC-experiments/envs/calc-linux/bin/python", python)
@@ -85,16 +89,19 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--token-limit", type=int, default=160000)
+    parser.add_argument("--run-tag", default="first20-flash-v2")
     parser.add_argument("--after-sanity", action="store_true",
                         help="Wait for the active one-task-per-method checks before expanding to 20")
     args = parser.parse_args()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.run_tag):
+        raise ValueError("run-tag must be a directory-safe identifier")
     task_file = args.root / "bench/browsecomp-plus/tasks/first20.dev.jsonl"
     tasks = [json.loads(line) for line in task_file.read_text().splitlines() if line.strip()][:args.limit]
     if not 1 <= args.limit <= 20 or not tasks:
         raise ValueError("Pilot limit must be between 1 and 20")
     if any(set(task) != {"query_id", "query"} for task in tasks):
         raise ValueError("Pilot input must contain only public query fields")
-    queue_root = args.root / "runs/first20-flash-v2"
+    queue_root = args.root / "runs" / args.run_tag
     queue_root.mkdir(parents=True, exist_ok=True)
     state_path = queue_root / "queue.json"
     if args.after_sanity:
@@ -113,7 +120,9 @@ def main() -> int:
                 raise TimeoutError("Sanity queue did not finish; inspect queue.json")
             time.sleep(5)
     state = json.loads(state_path.read_text()) if state_path.exists() else {
-        "kind": "development_first20", "model": "deepseek-flash", "evaluation": "not_run",
+        "kind": "development_pilot", "model": "deepseek-flash", "evaluation": "not_run",
+        "run_tag": args.run_tag, "token_stop_threshold": args.token_limit,
+        "query_ids": [str(task["query_id"]) for task in tasks], "methods": args.methods,
         "task_file_sha256": hashlib.sha256(task_file.read_bytes()).hexdigest(), "jobs": {},
     }
     if args.execute:
@@ -133,7 +142,7 @@ def main() -> int:
             qid = str(task["query_id"])
             key = f"{method}/{qid}"
             output = queue_root / method / qid
-            command, env = commands(args.root, method, task, output, args.token_limit)
+            command, env = commands(args.root, method, task, output, args.token_limit, args.run_tag)
             if not args.execute:
                 print(json.dumps({"dry_run": True, "job": key, "command": command}))
                 continue
@@ -145,7 +154,7 @@ def main() -> int:
             job = {"status": "running", "started_at": datetime.now(UTC).isoformat(),
                    "command": command, "output_dir": str(output)}
             if method == "dynaflow":
-                job["native_run_dir"] = str(args.root / "runs/dynaflow-flash-first20-prepared" / qid / "run")
+                job["native_run_dir"] = command[-1]
             state["jobs"][key] = job
             write_json(state_path, state)
             print(f"START {key}", flush=True)

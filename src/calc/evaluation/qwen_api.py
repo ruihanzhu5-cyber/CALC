@@ -73,11 +73,33 @@ def main() -> int:
     parser.add_argument("--ground-truth", type=Path)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--execute", action="store_true", help="Call the judge API; default checks configuration only")
+    parser.add_argument("--probe", action="store_true", help="Check authenticated model availability without generation")
     args = parser.parse_args()
     config = json.loads(args.config.read_text(encoding="utf-8-sig"))
     key_env = config.get("api_key_env", "BCP_JUDGE_API_KEY")
     key = os.environ.get(key_env)
     configured = bool(key and config.get("base_url", "").startswith(("https://", "http://")))
+    if args.probe:
+        if not configured:
+            raise ValueError("Configure the Qwen endpoint and API key before probing")
+        try:
+            with httpx.Client(timeout=60) as http:
+                response = http.get(config["base_url"].rstrip("/") + "/models",
+                                    headers={"Authorization": f"Bearer {key}"})
+                response.raise_for_status()
+                available = {item["id"] for item in response.json()["data"]}
+            probe = {"authenticated": True, "requested_model": config["model"],
+                     "model_available": config["model"] in available, "generation_calls": 0,
+                     "qwen3_32b_candidates": sorted(item for item in available if "qwen3-32b" in item.lower())}
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            probe = {"authenticated": False, "error_type": type(exc).__name__, "generation_calls": 0}
+            if isinstance(exc, httpx.HTTPStatusError):
+                probe["http_status"] = exc.response.status_code
+        if args.output_dir:
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            (args.output_dir / "model_availability.json").write_text(json.dumps(probe, indent=2), encoding="utf-8")
+        print(json.dumps(probe, indent=2))
+        return int(not probe.get("model_available", False))
     if not args.execute:
         print(json.dumps({"configuration_ready": configured, "model": config["model"],
                           "credential_present": bool(key), "model_calls": 0,

@@ -12,6 +12,8 @@ bash /mnt/d/CALC-experiments/code/CALC/scripts/baselines/dynaflow/start_bridge.s
 
 The shared queue at `scripts/run_first20.py` consumes the prepared `shards.json` command arrays. Every command explicitly selects the Linux Python and `/opt/calc/upstreams/DynaFlow/src`, so it does not fall back to Ubuntu's Python3.10. The common Windows `invoke_wsl_experiment.ps1` injects only `CALC_GATEWAY_KEY` into model clients; the real provider key remains in the gateway.
 
+For a fresh tagged development batch, `prepare_shards.py` accepts `--run-tag`, `--limit`, and `--output-root` (alias of `--out`). For example `--run-tag dev5-flash-1m-v0 --limit 5 --deadline 0 --max-model-requests 100 --observed-token-stop-threshold 1000000` creates endpoints `/v1/dev5-flash-1m-v0-dynaflow/{qid}`. Zero deadline means no additional native wall-clock limit; the common model gateway enforces the request/token stop thresholds. The manifest records these expected shared budgets, the frozen task-file hash and selected IDs; preparation does not reconfigure the gateway. Use a new output directory and new run tag for each protocol rather than reusing earlier paid runs or accounting.
+
 Official checkout: `https://github.com/amiya-special/Dynaflow`, commit `7451639d197ef844b4157cf40eadac68e9eba8ca`. This is the released portable inference runtime with an untrained main agent and a common API backbone. It is not a reproduction of the paper's trained Stage-1/Stage-2 checkpoint results.
 
 ## Prepared files

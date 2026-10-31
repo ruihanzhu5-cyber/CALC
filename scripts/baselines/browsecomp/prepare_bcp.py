@@ -157,6 +157,11 @@ def prepare_queries():
         for key in ordered:
             row = by_id[key]
             handle.write(json.dumps({"query_id": key, "answer": row["answer"]}, ensure_ascii=False) + "\n")
+    with (labels / "reference830.judge-only.jsonl").open("w", encoding="utf-8") as handle:
+        for key in ordered:
+            row = by_id[key]
+            handle.write(json.dumps({"query_id": key, "query": row["query"], "answer": row["answer"]},
+                                    ensure_ascii=False) + "\n")
     manifest = {
         "protocol": "CALC-v0 BCP research partition; not an official train/dev split",
         "source_repo": QUERY_REPO, "source_revision": QUERY_SHA, "official_split": "test",

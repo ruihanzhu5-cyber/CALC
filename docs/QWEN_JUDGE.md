@@ -1,6 +1,7 @@
 # Qwen3-32B 判题 API 接入
 
-当前状态：接口适配和离线测试已准备，未配置Qwen服务账号，没有发起真实judge调用。
+当前状态：已接通SiliconFlow Qwen/Qwen3-32B，模型列表鉴权通过，真实正/反判分样例均符合预期。
+CLM第177题的宽预算校准输出已真实评分，判定错误。这是单题开发诊断，不是方法整体正确率结论。
 缺少judge不影响agent复现；有最终答案后再离线判题，标准答案仅进入评分侧。
 
 ## 复用内容
@@ -37,7 +38,7 @@ $env:BCP_JUDGE_API_KEY = Read-Host 'Qwen judge API Key' -MaskInput
 & 'D:\CALC-experiments\envs\calc-win\Scripts\python.exe' -m calc.evaluation.qwen_api `
   --config configs/qwen_judge.example.json `
   --input-dir 'D:\CALC-experiments\runs\EXPORTED_OFFICIAL_RESULTS' `
-  --ground-truth 'D:\CALC-experiments\bench\browsecomp-plus\scoring-only\answers830.local.jsonl' `
+  --ground-truth 'D:\CALC-experiments\bench\browsecomp-plus\scoring-only\reference830.judge-only.jsonl' `
   --output-dir 'D:\CALC-experiments\evals\NEW_EVALUATION_DIRECTORY' `
   --execute
 ```
@@ -47,4 +48,14 @@ API若不支持参数，需要显式适配和记录，不能静默删参数后�
 
 输出每题原始判词、解析结果、真实usage和输入hash，并单独汇总答案正确率。
 Agent未完成按官方规则算失败，不调用judge。judge网络/格式错误保留错误并使汇总未完成，不拿裁判故障冒充Agent错误率。
-当前离线测试使用HTTP替身，验证协议与数据流，不代表真实Qwen判题质量；有接口后仍需进行真实小样本接入验证。
+离线单元测试使用HTTP替身；额外的真实API连接验证见D:\CALC-experiments\evals\qwen-protocol-smoke\protocol_check.json。
+
+## 本机安全启动器
+
+凭据保存在仓库外D:\CALC-experiments\secrets\siliconflow-qwen.dpapi，使用Windows DPAPI用户加密及受限目录ACL。
+scripts/invoke_qwen_judge.ps1仅在判题子进程中解密到环境变量，结束后恢复环境，不将密钥传给做题Agent。
+服务地址和模型配置在configs/qwen_judge.siliconflow.json；该文件不含Key。
+
+```powershell
+.\scripts\invoke_qwen_judge.ps1 -JudgeArguments @('--config','configs/qwen_judge.siliconflow.json','--probe')
+```
