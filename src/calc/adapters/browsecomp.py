@@ -239,7 +239,6 @@ def run_task(
         packet = compiler.compile(state, agent_id, budget=context_budget if worker else main_context_budget,
                                   mode="recent" if worker else ("state" if raw_main_history else "full"))
         last_round: list[dict[str, Any]] = []
-        force_finalize = False
         for step_index in range(steps):
             if max_requests and len(run.calls) >= max_requests:
                 return "", "max_model_requests"
@@ -293,8 +292,7 @@ def run_task(
                     else:
                         break
                 messages = prefix + [message for group in kept for message in group]
-            finalizing = bool(options.get("finalize_on_limit")) and not worker and (
-                force_finalize or step_index >= max(0, steps - 3))
+            finalizing = bool(options.get("finalize_on_limit")) and not worker and step_index >= max(0, steps - 3)
             if finalizing:
                 messages.append({"role": "user", "content":
                     "The research phase has ended. Submit your best final answer to the original question now, "
@@ -340,10 +338,10 @@ def run_task(
             if response.finish_reason in {"length", "content_filter"}:
                 if response.finish_reason == "length" and options.get("finalize_on_limit") and not worker:
                     # Preserve the generated reasoning/text but never execute an
-                    # incomplete tool call. The next ordinary turn is for submission.
+                    # incomplete tool call. Continue research with tools available;
+                    # only the final task turns require submission.
                     message.pop("tool_calls", None)
-                    force_finalize = True
-                    state.record("generation_truncated", agent_id=agent_id, action="finalize_next_turn")
+                    state.record("generation_truncated", agent_id=agent_id, action="continue_next_turn")
                     continue
                 return "", "max_tokens" if response.finish_reason == "length" else "content_filter"
             if not calls:
@@ -352,6 +350,9 @@ def run_task(
                 text = message.get("content") or ""
                 if not isinstance(text, str) or not text.strip():
                     return "", "empty_response"
+                if "<｜｜DSML｜｜" in text:
+                    run.error = "model returned raw tool protocol instead of a final answer"
+                    return "", "invalid_tool_protocol"
                 return text, "completed"
             new_count = 0
             for call in calls:

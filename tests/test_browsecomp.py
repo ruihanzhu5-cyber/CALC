@@ -15,7 +15,7 @@ def completion(message, *, finish_reason="stop", usage=None):
     })
 
 
-def test_main_truncation_gets_a_submission_turn_instead_of_immediate_failure():
+def test_main_truncation_continues_research_without_removing_tools():
     bodies = []
 
     def handle(request):
@@ -23,8 +23,7 @@ def test_main_truncation_gets_a_submission_turn_instead_of_immediate_failure():
         bodies.append(body)
         if len(bodies) == 1:
             return completion({"content": "Partial reasoning", "reasoning_content": "Working"}, finish_reason="length")
-        assert "tools" not in body
-        assert "Submit your best final answer" in body["messages"][-1]["content"]
+        assert body["tools"]
         return completion({"content": "Exact Answer: Test answer"})
 
     with httpx.Client(transport=httpx.MockTransport(handle)) as http:
@@ -34,6 +33,16 @@ def test_main_truncation_gets_a_submission_turn_instead_of_immediate_failure():
                           OpenAICompatibleClient("http://model.test/v1", "test", client=http),
                           BrowseCompRetriever("http://retriever.test", client=http))
     assert result.official["status"] == "completed" and len(result.calls) == 2
+
+
+def test_raw_model_tool_protocol_is_not_a_final_answer():
+    with httpx.Client(transport=httpx.MockTransport(lambda request: completion({
+        "content": '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="search">pending</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>'}))) as http:
+        result = run_task(BrowseCompTask("protocol", "Test question"), {"run": {"mode": "main"}},
+                          OpenAICompatibleClient("http://model.test/v1", "test", client=http),
+                          BrowseCompRetriever("http://retriever.test", client=http))
+    assert result.official["status"] == "invalid_tool_protocol"
+    assert not result.official["result"]
 
 
 def test_raw_history_projection_handles_pathological_document_title():

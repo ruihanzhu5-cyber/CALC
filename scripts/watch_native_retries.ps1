@@ -6,6 +6,7 @@ $ErrorActionPreference='Stop'
 $repo=Join-Path $ExperimentRoot 'code\CALC'
 $run=Join-Path (Join-Path $ExperimentRoot 'runs') $RunTag
 $python=Join-Path $ExperimentRoot 'envs\calc-win\Scripts\python.exe'
+while(-not(Test-Path -LiteralPath "$run\retry_manifest.json")){Start-Sleep -Seconds 2}
 $manifest=Get-Content -Raw -LiteralPath "$run\retry_manifest.json"|ConvertFrom-Json
 $status=[ordered]@{run_tag=$RunTag;kind='missing_submission_retry';expected_tasks=$manifest.retry_count;retained_tasks=$manifest.retained_count;methods=[ordered]@{}}
 foreach($method in @('main','porchestra','clm','dynaflow','joint')){$status.methods[$method]='waiting_for_actor_tasks'}

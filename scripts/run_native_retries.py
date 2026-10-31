@@ -9,9 +9,11 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 
 import httpx
 
+from export_pilot import convert
 from run_first20 import METHODS, commands, interrupt_queue, retrieval_preflight, run_wave, write_json
 
 
@@ -34,6 +36,49 @@ def select_retries(source: Path, query_ids: list[str]):
             else:
                 raise ValueError(f"Unexpected source evaluation state: {evaluation['status']}")
     return retained, retry
+
+
+def retain_recovery_submissions(root: Path, recovery_tag: str, retained: list, retry: list):
+    """Keep any completed, scored submission from an interrupted attempt, even wrong."""
+    recovery = root / "runs" / recovery_tag
+    remaining = []
+    for row in retry:
+        method, qid = row["method"], row["query_id"]
+        try:
+            native, _ = convert(root, recovery, recovery_tag, method, qid)
+        except (FileNotFoundError, KeyError):
+            native = None
+        texts = [item.get("output", "") for item in (native or {}).get("result", [])]
+        raw_tool_protocol = any("<｜｜DSML｜｜" in text for text in texts)
+        if native and native["status"] == "completed" and native["result"] and not raw_tool_protocol:
+            path = recovery / "evals" / method / f"run_{qid}_eval.json"
+            evaluation = json.loads(path.read_text(encoding="utf-8-sig"))
+            if evaluation["status"] != "judged":
+                raise ValueError(f"Score the retained submission first: {method}/{qid}")
+            retained.append({"method": method, "query_id": qid, "source_eval": str(path),
+                             "source_eval_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                             "retained_from_recovery": recovery_tag})
+        else:
+            remaining.append(row)
+    return retained, remaining
+
+
+def use_prebuilt_clm_task(root: Path, run_tag: str, job: dict, image: str):
+    """Copy public task inputs; use the identical prebuilt environment via Harbor."""
+    index = 2  # bash, run_clm_bcp.sh, HARBOR_TASK_DIRECTORY
+    source = Path(job["command"][index])
+    target = root / "runs" / run_tag / "clm-tasks" / source.name
+    if target.exists():
+        raise FileExistsError(target)
+    shutil.copytree(source, target)
+    config = target / "task.toml"
+    text = config.read_text()
+    text = text.replace("[environment]\n", f'[environment]\ndocker_image = "{image}"\n', 1)
+    config.write_text(text)
+    compose = target / "environment/docker-compose.yaml"
+    text = compose.read_text().replace("    build:\n      context: .\n      dockerfile: Dockerfile\n", "")
+    compose.write_text(text.replace("${MAIN_IMAGE_NAME}", "${PREBUILT_IMAGE_NAME}"))
+    job["command"][index] = str(target)
 
 
 def make_job(root: Path, run_tag: str, row: dict, task: dict):
@@ -70,6 +115,8 @@ def main():
     parser.add_argument("--run-tag", default="dev5-native-retry19-v2")
     parser.add_argument("--concurrency", type=int, default=19)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--recovery-run", help="Interrupted prior attempt; retain its complete scored submissions")
+    parser.add_argument("--clm-prebuilt-image", help="Identical environment image built before concurrent actors")
     args = parser.parse_args()
     import re
     if not all(re.fullmatch(r"[A-Za-z0-9_.-]+", name) for name in (args.source_run, args.run_tag)):
@@ -86,7 +133,17 @@ def main():
         raise ValueError("Actor input must contain only public question fields")
     by_id = {str(task["query_id"]): task for task in tasks}
     retained, retry = select_retries(source, list(by_id))
+    if args.recovery_run:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.recovery_run) or args.recovery_run == args.run_tag:
+            raise ValueError("Use a distinct safe recovery run tag")
+        retained, retry = retain_recovery_submissions(args.root, args.recovery_run, retained, retry)
     jobs = [make_job(args.root, args.run_tag, row, by_id[row["query_id"]]) for row in retry]
+    if args.clm_prebuilt_image:
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", args.clm_prebuilt_image):
+            raise ValueError("Pin the prebuilt image by its immutable local image ID")
+        for job in jobs:
+            if job["method"] == "clm":
+                use_prebuilt_clm_task(args.root, args.run_tag, job, args.clm_prebuilt_image)
     manifest = {"run_tag": args.run_tag, "source_run": args.source_run,
                 "created_at": datetime.now(UTC).isoformat(), "retained": retained, "retry": retry,
                 "retained_count": len(retained), "retry_count": len(retry),
@@ -103,6 +160,8 @@ def main():
                     "main_joint": {"task_steps": 100, "output_tokens": 4096, "model_input_budget": 32768,
                                    "origin": "own runtime; no author default; submission turns enabled"}},
                 "comparison_scope": "diagnostic retry cohort, not a fresh paired algorithm comparison"}
+    manifest.update(recovery_run=args.recovery_run, clm_prebuilt_image=args.clm_prebuilt_image,
+                    prior_attempt_costs="All prior model-calls logs remain chargeable; never replaced or reset")
     write_json(run / "retry_manifest.json", manifest)
     if not args.execute:
         print(json.dumps({"prepared": True, "retained": retained, "retry": retry,
@@ -119,10 +178,11 @@ def main():
     state = {"kind": "missing_submission_retry", "run_tag": args.run_tag, "source_run": args.source_run,
              "methods": list(METHODS), "query_ids": list(by_id), "concurrency": args.concurrency,
              "token_stop_threshold": None, "max_model_requests": None, "evaluation": "not_run", "jobs": {}}
+    state.update(scheduler_pid=os.getpid(), boot_id=Path("/proc/sys/kernel/random/boot_id").read_text().strip())
     write_json(run / "queue.json", state)
     previous = signal.signal(signal.SIGTERM, interrupt_queue)
     try:
-        code = run_wave(jobs, state, run / "queue.json", args.concurrency)
+        code = run_wave(jobs, state, run / "queue.json", args.concurrency, fail_fast=False)
         state["status"] = "actors_complete" if code == 0 else "actor_process_error"
         write_json(run / "queue.json", state)
         return code

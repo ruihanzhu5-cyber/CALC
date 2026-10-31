@@ -85,11 +85,13 @@ def commands(root: Path, method: str, task: dict, output: Path,
     return command, env
 
 
-def run_wave(jobs: list[dict], state: dict, state_path: Path, concurrency: int) -> int:
+def run_wave(jobs: list[dict], state: dict, state_path: Path, concurrency: int, *, fail_fast: bool = True) -> int:
     """Single-writer scheduler; each episode owns its process group and log."""
     active: list[tuple] = []
     pending = iter(jobs)
     exhausted = False
+    exit_code = 0
+    last_heartbeat = 0.0
     try:
         while active or not exhausted:
             # Observe failures before launching replacements.
@@ -106,8 +108,9 @@ def run_wave(jobs: list[dict], state: dict, state_path: Path, concurrency: int) 
                                           returncode=code, finished_at=datetime.now(UTC).isoformat())
                 write_json(state_path, state)
                 print(f"END {key}: {state['jobs'][key]['status']}", flush=True)
-                if code:
+                if code and fail_fast:
                     return code
+                exit_code = exit_code or code
             while len(active) < concurrency and not exhausted:
                 spec = next(pending, None)
                 if spec is None:
@@ -136,6 +139,10 @@ def run_wave(jobs: list[dict], state: dict, state_path: Path, concurrency: int) 
                 write_json(state_path, state)
                 print(f"START {key}", flush=True)
             if active:
+                if time.monotonic() - last_heartbeat >= 5:
+                    state["heartbeat_at"] = datetime.now(UTC).isoformat()
+                    write_json(state_path, state)
+                    last_heartbeat = time.monotonic()
                 time.sleep(0.1)
     finally:
         # SIGINT/SIGTERM or a failed sibling must not leave paid workers alive.
@@ -162,7 +169,7 @@ def run_wave(jobs: list[dict], state: dict, state_path: Path, concurrency: int) 
                                       finished_at=datetime.now(UTC).isoformat())
         if active:
             write_json(state_path, state)
-    return 0
+    return exit_code
 
 
 def retrieval_preflight(task: dict) -> None:
