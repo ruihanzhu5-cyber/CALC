@@ -70,6 +70,8 @@ node:24.14.0-bookworm-slim镜像digest为sha256:d8e448a56fc63242f70026718378bd4b
 .\scripts\invoke_wsl_experiment.ps1 /opt/calc/envs/calc/bin/python /mnt/d/CALC-experiments/code/CALC/scripts/run_first20.py --execute
 ```
 
+如果首题检查仍在运行，可在另一个后台进程使用同一命令加--after-sanity。它等待五个首题进程正常结束后扩到20，并复用已完成结果；若检查进程失败则停止扩展。
+
 本地鉴权token由启动器从用户已有凭据派生，只经进程环境传递。baseline进程拿不到真实provider key。
 队列文件queue.json记录每个process状态；process_completed不代表答对。官方正确性评分仍标evaluation=not_run。
 代码中的模型账本还记录诊断请求、重试、取消/断连、cache与reasoning子集；不把这些子集重复相加。

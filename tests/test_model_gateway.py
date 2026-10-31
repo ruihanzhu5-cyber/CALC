@@ -47,7 +47,7 @@ def test_gateway_auth_budget_forwarding_and_durable_usage(monkeypatch, tmp_path)
     try:
         assert send(url, key="wrong")[0] == 401
         assert send(url)[0] == 200
-        assert send(url)[0] == 429
+        assert send(url)[0] == 402
     finally:
         server.shutdown()
         server.server_close()

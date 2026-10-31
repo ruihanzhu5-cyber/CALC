@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import httpx
 
@@ -82,6 +83,8 @@ def main() -> int:
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--after-sanity", action="store_true",
+                        help="Wait for the active one-task-per-method checks before expanding to 20")
     args = parser.parse_args()
     task_file = args.root / "bench/browsecomp-plus/tasks/first20.dev.jsonl"
     tasks = [json.loads(line) for line in task_file.read_text().splitlines() if line.strip()][:args.limit]
@@ -92,6 +95,21 @@ def main() -> int:
     queue_root = args.root / "runs/first20-flash-v2"
     queue_root.mkdir(parents=True, exist_ok=True)
     state_path = queue_root / "queue.json"
+    if args.after_sanity:
+        if not args.execute:
+            raise ValueError("--after-sanity requires --execute")
+        first_id = str(tasks[0]["query_id"])
+        deadline = time.monotonic() + 3600
+        while True:
+            snapshot = json.loads(state_path.read_text()) if state_path.exists() else {"jobs": {}}
+            sanity = [snapshot["jobs"].get(f"{method}/{first_id}", {}) for method in METHODS]
+            if any(job.get("status") == "process_error" for job in sanity):
+                raise RuntimeError("A sanity process failed; fix its setup before expanding the paid queue")
+            if all(job.get("status") == "process_completed" for job in sanity):
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Sanity queue did not finish; inspect queue.json")
+            time.sleep(5)
     state = json.loads(state_path.read_text()) if state_path.exists() else {
         "kind": "development_first20", "model": "deepseek-flash", "evaluation": "not_run",
         "task_file_sha256": hashlib.sha256(task_file.read_bytes()).hexdigest(), "jobs": {},

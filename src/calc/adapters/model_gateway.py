@@ -129,7 +129,7 @@ class Gateway:
                                                   "message": "An earlier submitted request has unknown usage"}})
                         return
                     if previous["requests"] >= gateway.request_limit or previous["tokens"] >= gateway.token_limit:
-                        self.reply(429, {"error": {"type": "task_budget_exhausted",
+                        self.reply(402, {"error": {"type": "task_budget_exhausted",
                                                   "message": "Shared task budget exhausted"}})
                         return
                     record = {"task_key": task_key, "started_unix": time(), "state": "started",
