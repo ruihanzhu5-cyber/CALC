@@ -16,9 +16,13 @@ command=(python -m calc.adapters.model_gateway \
   --max-output-tokens "${CALC_MAX_OUTPUT_TOKENS:-4096}" \
   "${extra[@]}")
 if [[ "${CALC_SYSTEMD:-0}" == "1" ]]; then
+  env_file=/run/calc/gateway.env
+  trap 'rm -f -- "$env_file"' EXIT
+  python /mnt/d/CALC-experiments/code/CALC/scripts/write_service_environment.py "$env_file" \
+    DEEPSEEK_API_KEY CALC_GATEWAY_KEY DEEPSEEK_BASE_URL PATH PYTHONPATH
+  command[0]=/opt/calc/envs/calc/bin/python
   systemd-run --unit=calc-model-gateway --collect \
-    --setenv=DEEPSEEK_API_KEY --setenv=CALC_GATEWAY_KEY \
-    --setenv=DEEPSEEK_BASE_URL --setenv=PATH --setenv=PYTHONPATH \
+    --property=EnvironmentFile="$env_file" \
     --property=WorkingDirectory=/mnt/d/CALC-experiments/code/CALC \
     --property=StandardOutput=append:"$CALC_EXPERIMENT_ROOT/logs/model-gateway.log" \
     --property=StandardError=inherit "${command[@]}"

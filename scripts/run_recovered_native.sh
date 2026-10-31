@@ -61,9 +61,12 @@ PYTHONPATH=/opt/calc/upstreams/DynaFlow/src python scripts/baselines/dynaflow/pr
   --max-output 65536 --deadline 0 --max-model-requests 0 --observed-token-stop-threshold 0
 # systemd owns all descendants; --wait keeps the host's WSL session active.
 # No Restart policy: an interrupted paid attempt always requires an explicit recovery.
-exec systemd-run --unit="calc-actors-$tag" --collect --wait --pipe \
+env_file="/run/calc/actors-$tag.env"
+trap 'rm -f -- "$env_file"' EXIT
+python scripts/write_service_environment.py "$env_file" CALC_GATEWAY_KEY PATH PYTHONPATH
+systemd-run --unit="calc-actors-$tag" --collect --wait --pipe \
   --property=WorkingDirectory="$repo" --property=KillMode=mixed \
-  --setenv=CALC_GATEWAY_KEY --setenv=PATH --setenv=PYTHONPATH \
+  --property=EnvironmentFile="$env_file" \
   /opt/calc/envs/calc/bin/python scripts/run_native_retries.py \
   --run-tag "$tag" --recovery-run "$recovery" --concurrency 19 \
   --clm-prebuilt-image "$image" --execute
