@@ -4,7 +4,10 @@ set -euo pipefail
 source /mnt/d/CALC-experiments/code/CALC/scripts/experiment_env.sh
 tag=${1:?new run tag required}
 recovery=${2:?interrupted run tag required}
+concurrency=${3:-19}
+only_task=${4:-}
 [[ "$tag" =~ ^[A-Za-z0-9_.-]+$ && "$recovery" =~ ^[A-Za-z0-9_.-]+$ ]]
+[[ "$concurrency" =~ ^[1-9][0-9]*$ ]]
 repo="$CALC_EXPERIMENT_ROOT/code/CALC"
 run="$CALC_EXPERIMENT_ROOT/runs/$tag"
 mkdir -p "$run"
@@ -40,6 +43,9 @@ with httpx.Client(timeout=120,trust_env=False) as c:
     assert c.post('http://127.0.0.1:8765/document',json={'docid':rows[0]['docid']}).raise_for_status().json()['document']
 print('Actual corpus search and document preflight passed; no model calls')
 PY
+extra_args=()
+if [[ -n "$only_task" ]]; then extra_args+=(--only-task "$only_task"); fi
+if [[ -z "$only_task" || "$only_task" == clm/* ]]; then
 env_dir="$CALC_EXPERIMENT_ROOT/upstreams/CLM/calc_port/tasks_first20/bcp-717-d536a8c1/environment"
 # Verify all CLM build inputs are identical before reusing the image.
 python - <<'PY'
@@ -55,10 +61,14 @@ image=$(docker image inspect "calc-clm-bcp:$tag" --format '{{.Id}}')
 printf '%s\n' "$image" > "$run/clm-image-id.txt"
 docker run --rm --network host "$image" python3 -c \
   'import urllib.request; assert urllib.request.urlopen("http://127.0.0.1:8765/health",timeout=15).status==200; print("Prebuilt CLM container reaches corpus service")'
+extra_args+=(--clm-prebuilt-image "$image")
+fi
+if [[ -z "$only_task" || "$only_task" == dynaflow/* ]]; then
 PYTHONPATH=/opt/calc/upstreams/DynaFlow/src python scripts/baselines/dynaflow/prepare_shards.py \
   --tasks "$CALC_EXPERIMENT_ROOT/bench/browsecomp-plus/tasks/first20.dev.jsonl" \
   --out "$run/dynaflow-prepared" --run-tag "$tag" --limit 5 --native-settings \
   --max-output 65536 --deadline 0 --max-model-requests 0 --observed-token-stop-threshold 0
+fi
 # systemd owns all descendants; --wait keeps the host's WSL session active.
 # No Restart policy: an interrupted paid attempt always requires an explicit recovery.
 env_file="/run/calc/actors-$tag.env"
@@ -68,5 +78,5 @@ systemd-run --unit="calc-actors-$tag" --collect --wait --pipe \
   --property=WorkingDirectory="$repo" --property=KillMode=mixed \
   --property=EnvironmentFile="$env_file" \
   /opt/calc/envs/calc/bin/python scripts/run_native_retries.py \
-  --run-tag "$tag" --recovery-run "$recovery" --concurrency 19 \
-  --clm-prebuilt-image "$image" --execute
+  --run-tag "$tag" --recovery-run "$recovery" --concurrency "$concurrency" \
+  "${extra_args[@]}" --execute

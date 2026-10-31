@@ -1,6 +1,9 @@
 param(
     [string]$RunTag='dev5-native-recovery19-v3',
-    [string]$RecoveryRun='dev5-native-retry19-v2'
+    [string]$RecoveryRun='dev5-native-retry19-v2',
+    [ValidateRange(1,100)][int]$EpisodeConcurrency=19,
+    [ValidateRange(1,100)][int]$ModelConcurrency=32,
+    [string]$OnlyTask=''
 )
 $ErrorActionPreference='Stop'
 if($RunTag -notmatch '^[A-Za-z0-9_.-]+$' -or $RecoveryRun -notmatch '^[A-Za-z0-9_.-]+$'){throw 'Invalid run tags'}
@@ -13,9 +16,9 @@ foreach($name in @('DEEPSEEK_API_KEY','DEEPSEEK_BASE_URL')){
     if($value){[Environment]::SetEnvironmentVariable($name,$value,'Process')}
 }
 if(-not $env:DEEPSEEK_API_KEY){throw 'Provider credential unavailable to the user task'}
-$env:CALC_NATIVE_SETTINGS='1';$env:CALC_MODEL_CONCURRENCY='32';$env:CALC_TOKEN_LIMIT='0';$env:CALC_SYSTEMD='1'
+$env:CALC_NATIVE_SETTINGS='1';$env:CALC_MODEL_CONCURRENCY="$ModelConcurrency";$env:CALC_TOKEN_LIMIT='0';$env:CALC_SYSTEMD='1'
 Set-Location $repo
-$receipt=[ordered]@{run_tag=$RunTag;recovery_run=$RecoveryRun;status='starting';host_pid=$PID;started_at=[DateTimeOffset]::Now.ToString('o');host='Windows Task Scheduler';automatic_paid_restart=$false}
+$receipt=[ordered]@{run_tag=$RunTag;recovery_run=$RecoveryRun;only_task=$OnlyTask;episode_concurrency=$EpisodeConcurrency;model_concurrency=$ModelConcurrency;status='starting';host_pid=$PID;started_at=[DateTimeOffset]::Now.ToString('o');host='Windows Task Scheduler';automatic_paid_restart=$false}
 function Save-Receipt {$receipt|ConvertTo-Json -Depth 5|Set-Content -LiteralPath "$run\launch_receipt.json" -Encoding utf8}
 Save-Receipt
 try{
@@ -25,7 +28,9 @@ try{
     $pwsh=(Get-Process -Id $PID).Path
     $watcher=Start-Process -FilePath $pwsh -WindowStyle Hidden -PassThru -ArgumentList @('-NoProfile','-File',"$repo\scripts\watch_native_retries.ps1",'-RunTag',$RunTag) -RedirectStandardOutput "$run\judge-watcher.stdout.log" -RedirectStandardError "$run\judge-watcher.stderr.log"
     $receipt.watcher_pid=$watcher.Id;Save-Receipt
-    & "$repo\scripts\invoke_wsl_experiment.ps1" bash /mnt/d/CALC-experiments/code/CALC/scripts/run_recovered_native.sh $RunTag $RecoveryRun > "$run\actor-host.log" 2>&1
+    $linuxArguments=@('bash','/mnt/d/CALC-experiments/code/CALC/scripts/run_recovered_native.sh',$RunTag,$RecoveryRun,"$EpisodeConcurrency")
+    if($OnlyTask){$linuxArguments+=$OnlyTask}
+    & "$repo\scripts\invoke_wsl_experiment.ps1" @linuxArguments > "$run\actor-host.log" 2>&1
     $receipt.actor_exit=$LASTEXITCODE
     if($LASTEXITCODE -ne 0){throw 'Execution stopped; inspect actor-host.log. No automatic paid retry.'}
     $receipt.status='actors_finished_waiting_for_judge';Save-Receipt

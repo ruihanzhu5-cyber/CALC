@@ -117,6 +117,7 @@ def main():
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--recovery-run", help="Interrupted prior attempt; retain its complete scored submissions")
     parser.add_argument("--clm-prebuilt-image", help="Identical environment image built before concurrent actors")
+    parser.add_argument("--only-task", action="append", help="Explicit method/query_id subset; defer all others")
     args = parser.parse_args()
     import re
     if not all(re.fullmatch(r"[A-Za-z0-9_.-]+", name) for name in (args.source_run, args.run_tag)):
@@ -137,6 +138,13 @@ def main():
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.recovery_run) or args.recovery_run == args.run_tag:
             raise ValueError("Use a distinct safe recovery run tag")
         retained, retry = retain_recovery_submissions(args.root, args.recovery_run, retained, retry)
+    deferred = []
+    if args.only_task:
+        available = {f"{row['method']}/{row['query_id']}" for row in retry}
+        if not set(args.only_task) <= available:
+            raise ValueError("Requested subset must consist of missing submissions")
+        deferred = [row for row in retry if f"{row['method']}/{row['query_id']}" not in args.only_task]
+        retry = [row for row in retry if f"{row['method']}/{row['query_id']}" in args.only_task]
     jobs = [make_job(args.root, args.run_tag, row, by_id[row["query_id"]]) for row in retry]
     if args.clm_prebuilt_image:
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", args.clm_prebuilt_image):
@@ -161,6 +169,7 @@ def main():
                                    "origin": "own runtime; no author default; submission turns enabled"}},
                 "comparison_scope": "diagnostic retry cohort, not a fresh paired algorithm comparison"}
     manifest.update(recovery_run=args.recovery_run, clm_prebuilt_image=args.clm_prebuilt_image,
+                    deferred=deferred, deferred_count=len(deferred),
                     prior_attempt_costs="All prior model-calls logs remain chargeable; never replaced or reset")
     write_json(run / "retry_manifest.json", manifest)
     if not args.execute:
