@@ -51,17 +51,28 @@ def response_usage(raw: bytes, streaming: bool) -> dict[str, Any]:
 
 class Gateway:
     def __init__(self, root: Path, upstream: str, api_key: str, local_key: str,
-                 *, requests: int = 100, tokens: int = 160000) -> None:
+                 *, requests: int = 100, tokens: int = 160000, concurrency: int = 1) -> None:
+        if concurrency < 1:
+            raise ValueError("concurrency must be positive")
         self.root, self.upstream = root, upstream.rstrip("/")
         self.api_key, self.local_key = api_key, local_key
         self.request_limit, self.token_limit = requests, tokens
         self.lock = threading.Lock()
+        self.concurrency = concurrency
+        self.slots = threading.BoundedSemaphore(concurrency)
+        self.task_locks: dict[str, Any] = {}
         self.counts: dict[str, dict[str, int]] = {}
         self.root.mkdir(parents=True, exist_ok=True)
         # Resume accounting from durable records after a service restart.
         for path in sorted(self.root.glob("*/*/*.json")):
             record = json.loads(path.read_text(encoding="utf-8"))
             self.account(record["task_key"], record.get("usage") or {})
+
+    def task_lock(self, key: str):
+        # Keep one in-flight request per episode so budget reservations and
+        # unknown usage remain exact, while independent episodes can overlap.
+        with self.lock:
+            return self.task_locks.setdefault(key, threading.Lock())
 
     def account(self, key: str, usage: dict[str, Any]) -> None:
         total = usage.get("total_tokens")
@@ -89,7 +100,8 @@ class Gateway:
 
             def do_GET(self):
                 if self.path == "/health":
-                    self.reply(200, {"status": "ok", "max_in_flight_model_requests": 1,
+                    self.reply(200, {"status": "ok", "max_in_flight_model_requests": gateway.concurrency,
+                                     "max_in_flight_requests_per_task": 1,
                                      "request_limit_per_task": gateway.request_limit,
                                      "observed_token_stop_threshold": gateway.token_limit})
                 else:
@@ -122,7 +134,7 @@ class Gateway:
                 if streaming:
                     body["stream_options"] = {**(body.get("stream_options") or {}), "include_usage": True}
                 queued = perf_counter()
-                with gateway.lock:
+                with gateway.task_lock(task_key), gateway.slots:
                     previous = gateway.counts.get(task_key, {"requests": 0, "tokens": 0, "missing_usage": 0})
                     if previous["missing_usage"]:
                         self.reply(409, {"error": {"type": "accounting_incomplete",
@@ -193,10 +205,11 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--token-limit", type=int, default=160000)
     parser.add_argument("--request-limit", type=int, default=100)
+    parser.add_argument("--concurrency", type=int, default=1)
     args = parser.parse_args()
     gateway = Gateway(args.log_dir, os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
                       os.environ["DEEPSEEK_API_KEY"], os.environ["CALC_GATEWAY_KEY"],
-                      requests=args.request_limit, tokens=args.token_limit)
+                      requests=args.request_limit, tokens=args.token_limit, concurrency=args.concurrency)
     ThreadingHTTPServer((args.host, args.port), gateway.handler()).serve_forever()
 
 

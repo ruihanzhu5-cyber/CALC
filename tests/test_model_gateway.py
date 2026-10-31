@@ -1,10 +1,12 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer
 import threading
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
 import httpx
+import pytest
 
 from calc.adapters import model_gateway
 
@@ -126,3 +128,52 @@ def test_gateway_drains_usage_when_response_headers_cannot_be_delivered(monkeypa
         worker.join(timeout=5)
     record = json.loads(next(tmp_path.glob("main/disconnect/*.json")).read_text())
     assert record["client_disconnected"] and record["usage"]["total_tokens"] == 10
+
+
+@pytest.mark.parametrize("same_task", [False, True])
+def test_gateway_bounded_parallelism_and_per_task_budget(monkeypatch, tmp_path, same_task):
+    release = threading.Event()
+    reached = threading.Event()
+    lock = threading.Lock()
+    active = peak = calls = 0
+
+    def upstream(request):
+        nonlocal active, peak, calls
+        with lock:
+            active += 1
+            calls += 1
+            peak = max(peak, active)
+            if active == (1 if same_task else 2):
+                reached.set()
+        assert release.wait(3)
+        with lock:
+            active -= 1
+        return httpx.Response(200, json={"choices": [], "usage": {"total_tokens": 13}})
+
+    real_client = httpx.Client
+    monkeypatch.setattr(model_gateway.httpx, "Client", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(upstream), **kwargs))
+    gateway = model_gateway.Gateway(tmp_path, "http://upstream.test", "provider", "local-token",
+                                    concurrency=2, requests=1)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), gateway.handler())
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        with ThreadPoolExecutor(3) as pool:
+            futures = [pool.submit(send, f"http://127.0.0.1:{server.server_port}/v1/main/"
+                                   f"{'same' if same_task else index}/chat/completions") for index in range(3)]
+            try:
+                assert reached.wait(2), "Independent episodes must reach upstream concurrently"
+            finally:
+                release.set()
+            statuses = sorted(f.result()[0] for f in futures)
+        assert statuses == ([200, 402, 402] if same_task else [200, 200, 200])
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)
+    assert peak == (1 if same_task else 2)
+    assert calls == (1 if same_task else 3)
+    assert sum(item["requests"] for item in gateway.counts.values()) == calls
+    assert all(item["tokens"] == 13 and item["missing_usage"] == 0 for item in gateway.counts.values())

@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -82,17 +83,120 @@ def commands(root: Path, method: str, task: dict, output: Path,
     return command, env
 
 
+def run_wave(jobs: list[dict], state: dict, state_path: Path, concurrency: int) -> int:
+    """Single-writer scheduler; each episode owns its process group and log."""
+    active: list[tuple] = []
+    pending = iter(jobs)
+    exhausted = False
+    try:
+        while active or not exhausted:
+            # Observe failures before launching replacements.
+            for entry in list(active):
+                process, log, key, output = entry
+                code = process.poll()
+                if code is None:
+                    continue
+                log.close()
+                active.remove(entry)
+                if key.split("/", 1)[0] in {"main", "joint"} and code == 0 and not (output / "summary.json").is_file():
+                    code = 2
+                state["jobs"][key].update(status="process_completed" if code == 0 else "process_error",
+                                          returncode=code, finished_at=datetime.now(UTC).isoformat())
+                write_json(state_path, state)
+                print(f"END {key}: {state['jobs'][key]['status']}", flush=True)
+                if code:
+                    return code
+            while len(active) < concurrency and not exhausted:
+                spec = next(pending, None)
+                if spec is None:
+                    exhausted = True
+                    break
+                key, output = spec["key"], spec["output"]
+                output.mkdir(parents=True, exist_ok=True)
+                job = {"status": "running", "started_at": datetime.now(UTC).isoformat(),
+                       "command": spec["command"], "output_dir": str(output)}
+                if spec["method"] == "dynaflow":
+                    job["native_run_dir"] = spec["command"][-1]
+                state["jobs"][key] = job
+                write_json(state_path, state)
+                log = (output / "process.log").open("w", encoding="utf-8")
+                try:
+                    process = subprocess.Popen(spec["command"], env=spec["env"], stdout=log,
+                                               stderr=subprocess.STDOUT, start_new_session=os.name == "posix")
+                except OSError:
+                    log.close()
+                    job.update(status="process_error", error_type="process_start_failed",
+                               finished_at=datetime.now(UTC).isoformat())
+                    write_json(state_path, state)
+                    raise
+                job["pid"] = process.pid
+                active.append((process, log, key, output))
+                write_json(state_path, state)
+                print(f"START {key}", flush=True)
+            if active:
+                time.sleep(0.1)
+    finally:
+        # SIGINT/SIGTERM or a failed sibling must not leave paid workers alive.
+        for process, _log, _key, _output in active:
+            if process.poll() is None:
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    process.terminate()
+        for process, log, key, _output in active:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+                process.wait()
+            log.close()
+            state["jobs"][key].update(status="interrupted", returncode=process.returncode,
+                                      finished_at=datetime.now(UTC).isoformat())
+        if active:
+            write_json(state_path, state)
+    return 0
+
+
+def retrieval_preflight(task: dict) -> None:
+    # Health alone missed a wedged retriever in dev5. Exercise both real tool
+    # paths before starting any model requests; no labels or LLM are needed.
+    with httpx.Client(trust_env=False, timeout=15) as client:
+        response = client.post("http://127.0.0.1:8765/retrieve", json={"query": task["query"]})
+        response.raise_for_status()
+        rows = response.json()["result"]
+        if not rows:
+            raise RuntimeError("Retrieval preflight returned no documents")
+        response = client.post("http://127.0.0.1:8765/document", json={"docid": rows[0]["docid"]})
+        response.raise_for_status()
+        if not response.json().get("document"):
+            raise RuntimeError("Document-reader preflight returned no document")
+
+
+def interrupt_queue(*_args) -> None:
+    raise KeyboardInterrupt
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--concurrency", type=int, default=1,
+                        help="Concurrent independent episodes within each method; default 1")
     parser.add_argument("--token-limit", type=int, default=160000)
     parser.add_argument("--run-tag", default="first20-flash-v2")
     parser.add_argument("--after-sanity", action="store_true",
                         help="Wait for the active one-task-per-method checks before expanding to 20")
     args = parser.parse_args()
+    if args.concurrency < 1:
+        raise ValueError("concurrency must be positive")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.run_tag):
         raise ValueError("run-tag must be a directory-safe identifier")
     task_file = args.root / "bench/browsecomp-plus/tasks/first20.dev.jsonl"
@@ -125,6 +229,30 @@ def main() -> int:
         "query_ids": [str(task["query_id"]) for task in tasks], "methods": args.methods,
         "task_file_sha256": hashlib.sha256(task_file.read_bytes()).hexdigest(), "jobs": {},
     }
+    waves = []
+    for method in args.methods:
+        wave = []
+        for task in tasks:
+            qid = str(task["query_id"])
+            key = f"{method}/{qid}"
+            output = queue_root / method / qid
+            command, env = commands(args.root, method, task, output, args.token_limit, args.run_tag)
+            if not args.execute:
+                print(json.dumps({"dry_run": True, "job": key, "command": command,
+                                  "concurrency": args.concurrency}))
+                continue
+            previous = state["jobs"].get(key)
+            if previous and previous["status"] == "process_completed":
+                continue
+            if previous:
+                raise RuntimeError(f"Inspect incomplete job {key} before rerunning; no automatic paid retry")
+            wave.append({"key": key, "method": method, "output": output, "command": command, "env": env})
+        waves.append(wave)
+    if not args.execute:
+        return 0
+    if state.get("status") == "stopped_by_user":
+        raise RuntimeError("This run was stopped by the user; choose a new run tag")
+    state["concurrency"] = args.concurrency
     if args.execute:
         if not os.environ.get("CALC_GATEWAY_KEY"):
             raise ValueError("Use invoke_wsl_experiment.ps1 to inject CALC_GATEWAY_KEY")
@@ -132,42 +260,27 @@ def main() -> int:
             with httpx.Client(trust_env=False, timeout=15) as client:
                 health = client.get(f"http://127.0.0.1:{port}/health")
                 health.raise_for_status()
-                if port == 8767 and health.json()["observed_token_stop_threshold"] != args.token_limit:
-                    raise ValueError("Freeze the same token limit in the gateway and every pilot method before batching")
+                if port == 8767:
+                    if health.json()["observed_token_stop_threshold"] != args.token_limit:
+                        raise ValueError("Freeze the same token limit in the gateway and every pilot method before batching")
+                    if health.json()["max_in_flight_model_requests"] < args.concurrency:
+                        raise ValueError("Gateway concurrency must be at least the episode concurrency")
+        retrieval_preflight(tasks[0])
         if "dynaflow" in args.methods:
             with httpx.Client(trust_env=False, timeout=15) as client:
                 client.get("http://127.0.0.1:8766/ready").raise_for_status()
-    for method in args.methods:
-        for task in tasks:
-            qid = str(task["query_id"])
-            key = f"{method}/{qid}"
-            output = queue_root / method / qid
-            command, env = commands(args.root, method, task, output, args.token_limit, args.run_tag)
-            if not args.execute:
-                print(json.dumps({"dry_run": True, "job": key, "command": command}))
-                continue
-            if state["jobs"].get(key, {}).get("status") == "process_completed":
-                continue
-            if key in state["jobs"]:
-                raise RuntimeError(f"Inspect incomplete job {key} before rerunning; no automatic paid retry")
-            output.mkdir(parents=True, exist_ok=True)
-            job = {"status": "running", "started_at": datetime.now(UTC).isoformat(),
-                   "command": command, "output_dir": str(output)}
-            if method == "dynaflow":
-                job["native_run_dir"] = command[-1]
-            state["jobs"][key] = job
-            write_json(state_path, state)
-            print(f"START {key}", flush=True)
-            with (output / "process.log").open("w", encoding="utf-8") as log:
-                result = subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT)
-            if method in {"main", "joint"} and result.returncode == 0 and not (output / "summary.json").is_file():
-                result = subprocess.CompletedProcess(command, 2)
-            job.update(status="process_completed" if result.returncode == 0 else "process_error",
-                       returncode=result.returncode, finished_at=datetime.now(UTC).isoformat())
-            write_json(state_path, state)
-            print(f"END {key}: {job['status']}", flush=True)
-            if result.returncode:
-                return result.returncode
+    previous_handler = signal.signal(signal.SIGTERM, interrupt_queue)
+    try:
+        for wave in waves:
+            code = run_wave(wave, state, state_path, args.concurrency)
+            if code:
+                return code
+    except KeyboardInterrupt:
+        state.update(status="interrupted", stopped_at=datetime.now(UTC).isoformat())
+        write_json(state_path, state)
+        return 130
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
     return 0
 
 
