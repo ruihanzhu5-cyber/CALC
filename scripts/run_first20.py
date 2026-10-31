@@ -33,12 +33,14 @@ def write_json(path: Path, value) -> None:
 
 
 def commands(root: Path, method: str, task: dict, output: Path,
-             token_limit: int = 160000, run_tag: str = "first20-flash-v2") -> tuple[list[str], dict[str, str]]:
+             token_limit: int = 160000, run_tag: str = "first20-flash-v2",
+             max_output: int = 4096) -> tuple[list[str], dict[str, str]]:
     qid = str(task["query_id"])
     python = "/opt/calc/envs/calc/bin/python"
     base = f"http://127.0.0.1:8767/v1/{run_tag}-{method}/{qid}"
     env = os.environ.copy()
     env.pop("DEEPSEEK_API_KEY", None)
+    env["CALC_MAX_OUTPUT_TOKENS"] = str(max_output)
     env["NO_PROXY"] = env["no_proxy"] = "localhost,127.0.0.1,::1,host.docker.internal"
     env["TMPDIR"] = "/opt/calc/tmp"
     Path(env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
@@ -50,7 +52,7 @@ def commands(root: Path, method: str, task: dict, output: Path,
                     "timeout": 300, "reasoning_effort": "high", "extra_body": {"thinking": {"type": "enabled"}}},
             "retriever": {"base_url": "http://127.0.0.1:8765", "timeout": 60},
             "run": {"mode": method, "run_kind": "development_first20", "main_max_steps": 100,
-                    "worker_max_steps": 6, "max_model_requests": 100, "max_output_tokens": 4096,
+                    "worker_max_steps": 6, "max_model_requests": 100, "max_output_tokens": max_output,
                     "context_budget": 8192, "main_context_budget": 28672, "controller_interval": 3,
                     "main_history_mode": "raw", "model_input_budget": 32768, "max_total_tokens": token_limit},
         }
@@ -191,12 +193,13 @@ def main() -> int:
     parser.add_argument("--concurrency", type=int, default=1,
                         help="Concurrent independent episodes within each method; default 1")
     parser.add_argument("--token-limit", type=int, default=160000)
+    parser.add_argument("--max-output-tokens", type=int, default=4096)
     parser.add_argument("--run-tag", default="first20-flash-v2")
     parser.add_argument("--after-sanity", action="store_true",
                         help="Wait for the active one-task-per-method checks before expanding to 20")
     args = parser.parse_args()
-    if args.concurrency < 1:
-        raise ValueError("concurrency must be positive")
+    if min(args.concurrency, args.max_output_tokens) < 1:
+        raise ValueError("concurrency and max-output-tokens must be positive")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.run_tag):
         raise ValueError("run-tag must be a directory-safe identifier")
     task_file = args.root / "bench/browsecomp-plus/tasks/first20.dev.jsonl"
@@ -236,7 +239,8 @@ def main() -> int:
             qid = str(task["query_id"])
             key = f"{method}/{qid}"
             output = queue_root / method / qid
-            command, env = commands(args.root, method, task, output, args.token_limit, args.run_tag)
+            command, env = commands(args.root, method, task, output, args.token_limit, args.run_tag,
+                                    args.max_output_tokens)
             if not args.execute:
                 print(json.dumps({"dry_run": True, "job": key, "command": command,
                                   "concurrency": args.concurrency}))
@@ -253,6 +257,7 @@ def main() -> int:
     if state.get("status") == "stopped_by_user":
         raise RuntimeError("This run was stopped by the user; choose a new run tag")
     state["concurrency"] = args.concurrency
+    state["max_output_tokens"] = args.max_output_tokens
     if args.execute:
         if not os.environ.get("CALC_GATEWAY_KEY"):
             raise ValueError("Use invoke_wsl_experiment.ps1 to inject CALC_GATEWAY_KEY")
@@ -265,6 +270,8 @@ def main() -> int:
                         raise ValueError("Freeze the same token limit in the gateway and every pilot method before batching")
                     if health.json()["max_in_flight_model_requests"] < args.concurrency:
                         raise ValueError("Gateway concurrency must be at least the episode concurrency")
+                    if health.json().get("max_output_tokens", 4096) != args.max_output_tokens:
+                        raise ValueError("Freeze the same output token limit in the gateway and every pilot method")
         retrieval_preflight(tasks[0])
         if "dynaflow" in args.methods:
             with httpx.Client(trust_env=False, timeout=15) as client:

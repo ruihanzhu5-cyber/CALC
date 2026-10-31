@@ -23,11 +23,15 @@ Save-Status
 foreach ($method in $methods) {
     while ($true) {
         $queue = Get-Content -Raw -LiteralPath $queuePath | ConvertFrom-Json
+        if ($queue.status -in @('stopped_by_user','interrupted')) {
+            $status['status']='stopped_with_actor_queue'; Save-Status
+            exit 0
+        }
         $states = @($queries | ForEach-Object {
             $property = $queue.jobs.PSObject.Properties["$method/$_"]
             if ($null -eq $property) { 'queued' } else { $property.Value.status }
         })
-        if ($states -contains 'process_error') {
+        if (@($states | Where-Object { $_ -in @('process_error','interrupted','interrupted_by_user') }).Count -gt 0) {
             $status.methods[$method] = 'blocked_actor_process_error'; Save-Status
             throw "Inspect failed actor process for $method before scoring."
         }
@@ -50,7 +54,7 @@ foreach ($method in $methods) {
         if ($LASTEXITCODE -ne 0) { $status.methods[$method]='judge_error'; Save-Status; exit $LASTEXITCODE }
     }
     $summary = Get-Content -Raw -LiteralPath $summaryPath | ConvertFrom-Json
-    if ($summary.evaluation -ne 'complete' -or $summary.num_tasks -ne $Limit) {
+    if ($summary.evaluation -ne 'complete' -or $summary.num_tasks -ne $Limit -or $summary.num_judge_errors -ne 0) {
         $status.methods[$method]='incomplete_evaluation'; Save-Status
         throw 'Evaluation does not cover the complete selected task set.'
     }

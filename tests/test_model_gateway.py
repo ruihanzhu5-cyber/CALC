@@ -23,7 +23,8 @@ def send(url, *, key="local-token", stream=False):
         return response.status, response.read()
 
 
-def test_gateway_auth_budget_forwarding_and_durable_usage(monkeypatch, tmp_path):
+@pytest.mark.parametrize("output_tokens", [4096, 16384])
+def test_gateway_auth_budget_forwarding_and_durable_usage(monkeypatch, tmp_path, output_tokens):
     forwarded = []
 
     def upstream(request):
@@ -34,6 +35,7 @@ def test_gateway_auth_budget_forwarding_and_durable_usage(monkeypatch, tmp_path)
         assert request.headers["Authorization"] == "Bearer upstream-secret"
         body = json.loads(request.content)
         assert body["thinking"] == {"type": "enabled"}
+        assert body["max_tokens"] == output_tokens
         return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "OK"}}],
                                         "usage": {"prompt_tokens": 11, "completion_tokens": 2,
                                                   "total_tokens": 13}})
@@ -41,7 +43,8 @@ def test_gateway_auth_budget_forwarding_and_durable_usage(monkeypatch, tmp_path)
     real_client = httpx.Client
     monkeypatch.setattr(model_gateway.httpx, "Client", lambda **kwargs: real_client(
         transport=httpx.MockTransport(upstream), **kwargs))
-    gateway = model_gateway.Gateway(tmp_path, "http://upstream.test", "upstream-secret", "local-token", requests=1)
+    gateway = model_gateway.Gateway(tmp_path, "http://upstream.test", "upstream-secret", "local-token", requests=1,
+                                    output_tokens=output_tokens)
     server = ThreadingHTTPServer(("127.0.0.1", 0), gateway.handler())
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()

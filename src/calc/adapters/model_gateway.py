@@ -51,14 +51,16 @@ def response_usage(raw: bytes, streaming: bool) -> dict[str, Any]:
 
 class Gateway:
     def __init__(self, root: Path, upstream: str, api_key: str, local_key: str,
-                 *, requests: int = 100, tokens: int = 160000, concurrency: int = 1) -> None:
-        if concurrency < 1:
-            raise ValueError("concurrency must be positive")
+                 *, requests: int = 100, tokens: int = 160000, concurrency: int = 1,
+                 output_tokens: int = 4096) -> None:
+        if min(concurrency, output_tokens) < 1:
+            raise ValueError("concurrency and output_tokens must be positive")
         self.root, self.upstream = root, upstream.rstrip("/")
         self.api_key, self.local_key = api_key, local_key
         self.request_limit, self.token_limit = requests, tokens
         self.lock = threading.Lock()
         self.concurrency = concurrency
+        self.output_limit = output_tokens
         self.slots = threading.BoundedSemaphore(concurrency)
         self.task_locks: dict[str, Any] = {}
         self.counts: dict[str, dict[str, int]] = {}
@@ -102,6 +104,7 @@ class Gateway:
                 if self.path == "/health":
                     self.reply(200, {"status": "ok", "max_in_flight_model_requests": gateway.concurrency,
                                      "max_in_flight_requests_per_task": 1,
+                                     "max_output_tokens": gateway.output_limit,
                                      "request_limit_per_task": gateway.request_limit,
                                      "observed_token_stop_threshold": gateway.token_limit})
                 else:
@@ -129,7 +132,8 @@ class Gateway:
                 body["thinking"] = {"type": "enabled"}
                 body["reasoning_effort"] = "high"
                 body.pop("temperature", None)  # Ignored by the provider in thinking mode.
-                body["max_tokens"] = min(int(body.pop("max_completion_tokens", body.get("max_tokens", 4096))), 4096)
+                requested_output = body.pop("max_completion_tokens", body.get("max_tokens")) or gateway.output_limit
+                body["max_tokens"] = min(int(requested_output), gateway.output_limit)
                 streaming = bool(body.get("stream", False))
                 if streaming:
                     body["stream_options"] = {**(body.get("stream_options") or {}), "include_usage": True}
@@ -206,10 +210,12 @@ def main() -> None:
     parser.add_argument("--token-limit", type=int, default=160000)
     parser.add_argument("--request-limit", type=int, default=100)
     parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--max-output-tokens", type=int, default=4096)
     args = parser.parse_args()
     gateway = Gateway(args.log_dir, os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
                       os.environ["DEEPSEEK_API_KEY"], os.environ["CALC_GATEWAY_KEY"],
-                      requests=args.request_limit, tokens=args.token_limit, concurrency=args.concurrency)
+                      requests=args.request_limit, tokens=args.token_limit, concurrency=args.concurrency,
+                      output_tokens=args.max_output_tokens)
     ThreadingHTTPServer((args.host, args.port), gateway.handler()).serve_forever()
 
 
