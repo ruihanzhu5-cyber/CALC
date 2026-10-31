@@ -30,7 +30,8 @@ def write_json(path: Path, value) -> None:
     temporary.replace(path)
 
 
-def commands(root: Path, method: str, task: dict, output: Path) -> tuple[list[str], dict[str, str]]:
+def commands(root: Path, method: str, task: dict, output: Path,
+             token_limit: int = 160000) -> tuple[list[str], dict[str, str]]:
     qid = str(task["query_id"])
     python = "/opt/calc/envs/calc/bin/python"
     base = f"http://127.0.0.1:8767/v1/first20-{method}-v2/{qid}"
@@ -49,7 +50,7 @@ def commands(root: Path, method: str, task: dict, output: Path) -> tuple[list[st
             "run": {"mode": method, "run_kind": "development_first20", "main_max_steps": 100,
                     "worker_max_steps": 6, "max_model_requests": 100, "max_output_tokens": 4096,
                     "context_budget": 8192, "main_context_budget": 28672, "controller_interval": 3,
-                    "main_history_mode": "raw", "model_input_budget": 32768, "max_total_tokens": 160000},
+                    "main_history_mode": "raw", "model_input_budget": 32768, "max_total_tokens": token_limit},
         }
         config_path = root / "configs/first20" / method / f"{qid}.json"
         write_json(config_path, config)
@@ -83,6 +84,7 @@ def main() -> int:
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--token-limit", type=int, default=160000)
     parser.add_argument("--after-sanity", action="store_true",
                         help="Wait for the active one-task-per-method checks before expanding to 20")
     args = parser.parse_args()
@@ -119,7 +121,10 @@ def main() -> int:
             raise ValueError("Use invoke_wsl_experiment.ps1 to inject CALC_GATEWAY_KEY")
         for port in (8765, 8767):
             with httpx.Client(trust_env=False, timeout=15) as client:
-                client.get(f"http://127.0.0.1:{port}/health").raise_for_status()
+                health = client.get(f"http://127.0.0.1:{port}/health")
+                health.raise_for_status()
+                if port == 8767 and health.json()["observed_token_stop_threshold"] != args.token_limit:
+                    raise ValueError("Freeze the same token limit in the gateway and every pilot method before batching")
         if "dynaflow" in args.methods:
             with httpx.Client(trust_env=False, timeout=15) as client:
                 client.get("http://127.0.0.1:8766/ready").raise_for_status()
@@ -128,7 +133,7 @@ def main() -> int:
             qid = str(task["query_id"])
             key = f"{method}/{qid}"
             output = queue_root / method / qid
-            command, env = commands(args.root, method, task, output)
+            command, env = commands(args.root, method, task, output, args.token_limit)
             if not args.execute:
                 print(json.dumps({"dry_run": True, "job": key, "command": command}))
                 continue

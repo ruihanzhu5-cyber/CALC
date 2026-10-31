@@ -191,9 +191,12 @@ def main() -> None:
     parser.add_argument("--log-dir", type=Path, required=True)
     parser.add_argument("--port", type=int, default=8767)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--token-limit", type=int, default=160000)
+    parser.add_argument("--request-limit", type=int, default=100)
     args = parser.parse_args()
     gateway = Gateway(args.log_dir, os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-                      os.environ["DEEPSEEK_API_KEY"], os.environ["CALC_GATEWAY_KEY"])
+                      os.environ["DEEPSEEK_API_KEY"], os.environ["CALC_GATEWAY_KEY"],
+                      requests=args.request_limit, tokens=args.token_limit)
     ThreadingHTTPServer((args.host, args.port), gateway.handler()).serve_forever()
 
 
