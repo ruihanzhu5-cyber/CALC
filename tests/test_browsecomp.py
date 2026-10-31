@@ -58,6 +58,127 @@ def test_retriever_uses_official_post_retrieve_contract():
         assert retriever.search("query here") == [{"docid": "42", "title": "Document", "text": "Evidence text"}]
 
 
+def test_document_reader_fetches_new_source_and_retains_it_for_handoff():
+    bodies = []
+
+    def handle(request):
+        if request.url.host == "retriever.test":
+            assert request.url.path == "/document"
+            assert json.loads(request.content) == {"docid": "source-42"}
+            return httpx.Response(200, json={"document": {
+                "docid": "source-42", "title": "Primary source", "text": "Full source establishes Blue."},
+                "truncated": True})
+        body = json.loads(request.content)
+        bodies.append(body)
+        if len(bodies) == 1:
+            return completion({"content": None, "reasoning_content": "Need the primary source.",
+                               "tool_calls": [{"id": "read-42", "type": "function", "function": {
+                                   "name": "get_document", "arguments": '{"docid":"source-42"}'}}]},
+                              finish_reason="tool_calls")
+        assert body["messages"][-2]["reasoning_content"] == "Need the primary source."
+        assert "Full source establishes Blue." in body["messages"][-1]["content"]
+        return completion({"content": "Explanation: Primary source [source-42].\nExact Answer: Blue\nConfidence: 90%"})
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http:
+        result = run_task(BrowseCompTask("doc-test", "Which color?"), {"run": {"mode": "main"}},
+                          OpenAICompatibleClient("http://model.test/v1", "test", client=http),
+                          BrowseCompRetriever("http://retriever.test", client=http))
+    assert result.official["status"] == "completed"
+    assert result.official["retrieved_docids"] == ["source-42"]
+    assert result.official["tool_call_counts"]["get_document"] == 1
+    assert any(e.source == "source-42" and "Full source" in e.content for e in result.state.evidence.values())
+
+
+def test_document_reader_rejects_mismatched_source_identity():
+    def handle(request):
+        return httpx.Response(200, json={"document": {"docid": "another", "text": "Wrong source"}})
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http:
+        retriever = BrowseCompRetriever("http://retriever.test", client=http)
+        with pytest.raises(ValueError, match="does not match"):
+            retriever.get_document("requested")
+
+
+def test_raw_main_context_keeps_each_observation_once():
+    calls = []
+
+    def handle(request):
+        if request.url.host == "retriever.test":
+            return httpx.Response(200, json={"result": [{"docid": "d1", "document": {
+                "title": "Source", "text": "DISTINCT_SOURCE_FACT establishes Blue."}}]})
+        body = json.loads(request.content)
+        calls.append(body)
+        if len(calls) == 1:
+            return completion(tool_call(), finish_reason="tool_calls")
+        assert json.dumps(body["messages"]).count("DISTINCT_SOURCE_FACT") == 1
+        assert body["messages"][-1]["tool_call_id"] == "call-1"
+        return completion({"content": "Explanation: Source [d1].\nExact Answer: Blue\nConfidence: 90%"})
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http:
+        result = run_task(BrowseCompTask("raw", "Which color?"), {"run": {
+            "mode": "main", "main_history_mode": "raw", "main_context_budget": 28672}},
+            OpenAICompatibleClient("http://model.test/v1", "test", client=http),
+            BrowseCompRetriever("http://retriever.test", client=http))
+    assert result.official["status"] == "completed" and len(calls) == 2
+
+
+def test_cumulative_worker_handoffs_do_not_repeat_prior_source_text():
+    model_turn = 0
+
+    def handle(request):
+        nonlocal model_turn
+        if request.url.host == "retriever.test":
+            docid = json.loads(request.content)["query"]
+            return httpx.Response(200, json={"result": [{"docid": docid, "document": {
+                "title": docid, "text": "UNIQUE_SOURCE_" + docid}}]})
+        model_turn += 1
+        body = json.loads(request.content)
+        if model_turn in {1, 3}:
+            return completion(tool_call(query=f"doc{model_turn}", call_id=f"call-{model_turn}"),
+                              finish_reason="tool_calls")
+        if model_turn in {2, 4}:
+            return completion({"content": f"Findings cite [doc{model_turn - 1}]."})
+        encoded = json.dumps(body["messages"])
+        assert encoded.count("UNIQUE_SOURCE_doc1") == 1
+        assert encoded.count("UNIQUE_SOURCE_doc3") == 1
+        return completion({"content": "Explanation: Both sources.\nExact Answer: Blue\nConfidence: 90%"})
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http:
+        result = run_task(BrowseCompTask("two-workers", "Which color?"), {"run": {
+            "mode": "fixed", "main_history_mode": "raw", "main_context_budget": 28672,
+            "worker_goals": ["First investigation", "Second investigation"]}},
+            OpenAICompatibleClient("http://model.test/v1", "test", client=http),
+            BrowseCompRetriever("http://retriever.test", client=http))
+    assert result.official["status"] == "completed" and model_turn == 5
+
+
+def test_oversized_tool_batch_keeps_ids_and_uses_recoverable_archive():
+    calls = []
+
+    def handle(request):
+        if request.url.host == "retriever.test":
+            return httpx.Response(200, json={"result": [{"docid": "large", "document": {
+                "title": "Large", "text": "Large source text " * 2000}}]})
+        body = json.loads(request.content)
+        calls.append(body)
+        if len(calls) == 1:
+            return completion(tool_call(), finish_reason="tool_calls")
+        observation = json.loads(body["messages"][-1]["content"])
+        assert observation["observation_projected"]
+        assert observation["sources"][0]["docid"] == "large"
+        assert observation["sources"][0]["evidence_id"].startswith("doc:large:")
+        assert body["messages"][-1]["tool_call_id"] == "call-1"
+        return completion({"content": "Explanation: Archive source [large].\nExact Answer: Blue\nConfidence: 90%"})
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http:
+        result = run_task(BrowseCompTask("large-round", "Which color?"), {"run": {
+            "mode": "main", "main_history_mode": "raw", "model_input_budget": 2000}},
+            OpenAICompatibleClient("http://model.test/v1", "test", client=http),
+            BrowseCompRetriever("http://retriever.test", client=http))
+    assert result.official["status"] == "completed"
+    assert len(next(iter(result.state.evidence.values())).content) > 20000
+
+
 def test_main_http_tool_loop_preserves_protocol_and_official_artifacts(tmp_path):
     requests = []
 
@@ -97,7 +218,7 @@ def test_main_http_tool_loop_preserves_protocol_and_official_artifacts(tmp_path)
         assert set(result) == {"query_id", "tool_call_counts", "status", "retrieved_docids", "result"}
         assert result["query_id"] == "q/1" and result["status"] == "completed"
         assert result["retrieved_docids"] == ["doc-1"]
-        assert result["tool_call_counts"] == {"search": 1, "read_evidence": 0}
+        assert result["tool_call_counts"] == {"search": 1, "get_document": 0, "read_evidence": 0}
         assert result["result"][0]["type"] == "output_text"
         trace = next((tmp_path / "out" / "traces").glob("*.json")).read_text()
         assert "HIDDEN_ANSWER" not in trace and "unit-test-secret" not in trace
@@ -204,7 +325,8 @@ def test_main_projects_context_and_recalls_an_omitted_document_locally():
                 "title": "Large document", "text": document}}]})
         body = json.loads(request.content)
         requests.append(body)
-        assert {tool["function"]["name"] for tool in body["tools"]} == {"search", "read_evidence"}
+        assert {tool["function"]["name"] for tool in body["tools"]} == {
+            "search", "get_document", "read_evidence"}
         if len(requests) == 1:
             return completion(tool_call(), finish_reason="tool_calls")
         if len(requests) == 2:
@@ -232,7 +354,7 @@ def test_main_projects_context_and_recalls_an_omitted_document_locally():
                        BrowseCompRetriever("http://retriever.test", client=http))
     assert run.official["status"] == "completed"
     assert len(search_requests) == 1
-    assert run.official["tool_call_counts"] == {"search": 1, "read_evidence": 2}
+    assert run.official["tool_call_counts"] == {"search": 1, "get_document": 0, "read_evidence": 2}
     assert run.official["retrieved_docids"] == ["large"]
     projections = [event for event in run.state.events if event["event"] == "context_prepared"]
     assert len(projections) == 4 and all(event["packet_mode"] == "full" for event in projections)

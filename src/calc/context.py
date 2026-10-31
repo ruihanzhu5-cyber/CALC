@@ -61,7 +61,7 @@ class ContextCompiler:
         self, state: TaskState, recipient: str, work_ids: list[str] | None = None,
         budget: int = 2048, mode: str = "evidence",
     ) -> ContextPacket:
-        if mode not in {"evidence", "recent", "full"}:
+        if mode not in {"evidence", "recent", "full", "state"}:
             raise ValueError(f"unknown packet mode: {mode}")
         if work_ids is None:
             work_ids = [work.id for work in state.work_items.values() if work.owner == recipient]
@@ -95,7 +95,7 @@ class ContextCompiler:
         if mode in {"recent", "full"}:
             owners = list(dict.fromkeys([work.owner for work in works] + [recipient]))
             history = [message for owner in owners if owner in state.agents
-                       for message in state.agents[owner].history]
+                       for message in state.agents[owner].history if not message.get("context_view")]
             retained: list[str] = []
             for message in reversed(history):
                 block = json.dumps(message, ensure_ascii=False, default=str)

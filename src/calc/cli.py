@@ -40,3 +40,7 @@ def main(argv: list[str] | None = None) -> int:
         result = run_browsecomp(args.config)
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
