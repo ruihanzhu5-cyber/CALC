@@ -6,6 +6,10 @@ CALC 将“谁继续执行、把职责交给谁、接收者获得什么信息”
 
 ## 方法闭环
 
+![CALC V0 当前系统架构](figures/calc-v0-architecture.png)
+
+[架构与代码映射](figures/calc-v0-architecture.md) · [矢量图](figures/calc-v0-architecture.svg) · [可编辑 Mermaid 源码](figures/calc-v0-architecture.mmd)
+
 1. **Task–Evidence State** 保存任务、未完成职责、证据出处与版本、责任归属及原始执行历史。
 2. **Joint Controller** 选择生命周期动作、接收者、工作项和上下文包。规则版用于先验证闭环；学习型贡献估计是后续可替换组件。
 3. **Context Transfer Runtime** 将选择编译成下一次调用的输入视图，提交证据和未完职责后改变执行状态，并支持恢复与重新分配。
