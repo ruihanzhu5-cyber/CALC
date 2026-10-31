@@ -1,0 +1,27 @@
+{
+  "tasks_path": "../data/browsecomp_queries.jsonl",
+  "output_dir": "../runs/browsecomp-joint-seed0",
+  "limit": 2,
+  "llm": {
+    "base_url": "https://api.example.invalid/v1",
+    "model": "SET_YOUR_MODEL",
+    "api_key_env": "CALC_LLM_API_KEY",
+    "output_token_field": "max_tokens",
+    "temperature": 0,
+    "timeout": 120
+  },
+  "retriever": {"base_url": "http://127.0.0.1:8001", "timeout": 60},
+  "run": {
+    "mode": "joint",
+    "run_kind": "live",
+    "main_max_steps": 30,
+    "worker_max_steps": 6,
+    "max_model_requests": 50,
+    "max_output_tokens": 2048,
+    "context_budget": 2048,
+    "worker_goals": [
+      "Find candidate entities and source evidence satisfying the question's constraints.",
+      "Independently check the constraints and investigate missing or conflicting evidence."
+    ]
+  }
+}
