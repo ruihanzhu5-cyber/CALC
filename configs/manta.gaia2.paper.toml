@@ -1,0 +1,33 @@
+[openrouter]
+base_url = "https://api.deepseek.com/v1"
+timeout_s = 600
+[models]
+default = "deepseek-flash"
+[experiment]
+seed = 42
+runs_per_task = 1
+task_limit = 5
+[mas]
+levels = 1
+intra_level_link_ratio = 1.0
+full_linked = true
+topology = "self_evolved"
+number_of_agents = 5
+agent_types = ["general"]
+communication_count_internally = 2
+turn_mode = "multi_turn"
+max_turns = 2
+discussion_rounds = 2
+termination_consensus_mode = "llm_judge"
+final_vote_mode = "llm_judge"
+[self_evolved]
+initial_planner_mode = "task_conditioned"
+max_initial_agents = 5
+max_total_agents = 10
+max_turns = 2
+repair_budget = 1
+audit_mode = "hybrid"
+playbook_read = true
+skill_update_batch_size = 12
+skill_path = "/mnt/d/CALC-experiments/upstreams/MANTA-native/config/topology_skill.md"
+playbook_path = "/mnt/d/CALC-experiments/upstreams/MANTA-native/config/topology_playbook.json"

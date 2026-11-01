@@ -161,6 +161,7 @@ class AdaptiveRuntime:
                  environment_context: str = "", collaboration_mode: str = "full",
                  resource_key: Callable[[str, dict], str | None] | None = None,
                  progress_checkpoints: bool = True,
+                 external_events: Callable[[], list[dict]] | None = None,
                  clock: Callable[[], float] = perf_counter):
         if concurrency < 1 or max_output_tokens < 1 or (max_waves is not None and max_waves < 1):
             raise ValueError("positive concurrency/output/wave limits required")
@@ -189,6 +190,8 @@ class AdaptiveRuntime:
         self.initial_open = True
         self.resource_key = resource_key
         self.progress_checkpoints = progress_checkpoints
+        self.external_events = external_events
+        self.external_seen: set[str] = set()
         self.requests: dict[str, dict] = {}
         self.seen_proposals: set[str] = set()
         self.seen_notices: set[str] = set()
@@ -742,14 +745,40 @@ class AdaptiveRuntime:
         else:
             self.final = text
 
-    def run(self, instruction: str) -> dict:
-        if self.loops:
+    def _poll_external(self) -> None:
+        for event in self.external_events() if self.external_events else []:
+            identity = event["id"]
+            if identity in self.external_seen:
+                continue
+            self.external_seen.add(identity)
+            self.emit("external_event", **event)
+            for actor in self.loops.values():
+                if actor.status not in {"ready", "waiting", "review"}:
+                    continue
+                actor.messages.append({"role": "user", "content": "Environment update: " + json.dumps(event)})
+                actor.version += 1
+                self._checkpoint(actor, "environment_update", identity, event)
+                if actor.status == "waiting":
+                    actor.status = "ready"
+
+    def run(self, instruction: str, *, resume: bool = False) -> dict:
+        if self.loops and not resume:
             raise ValueError("one runtime instance per task")
         start = self.clock()
-        self._new(instruction, None, "strong", [])
+        if resume:
+            if not self.final or self._live_children("main"):
+                raise ValueError("resume requires a completed user turn")
+            main = self.loops["main"]
+            main.status, main.resolved, self.final = "ready", False, ""
+            main.messages.append({"role": "user", "content": instruction})
+            main.version += 1
+            self._checkpoint(main, "user_turn", str(main.version), {"instruction": instruction})
+        else:
+            self._new(instruction, None, "strong", [])
         wave = 0
         reason = "answered"
         while not self.final:
+            self._poll_external()
             self._unblock()
             ready = [a for a in self.loops.values() if a.status == "ready" and
                      all(self._satisfied(d) for d in a.dependencies)]
