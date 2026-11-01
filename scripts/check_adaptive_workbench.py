@@ -30,7 +30,34 @@ class Scripted:
 
     def complete(self, messages, **kwargs):
         item = next(self.responses)
-        return item(messages) if callable(item) else item
+        result = item(messages) if callable(item) else item
+        system = messages[0]["content"]
+        checkpoints = json.loads(system.split("Pending progress checkpoints: ")[1].split("\n")[0])
+        if not checkpoints:
+            return result
+        actor = system.split("You are ")[1].split(".")[0]
+        state = json.loads(system.split("Current team state: ")[1].split("\n")[0])
+        current = next(a for a in state if a["id"] == actor)
+        p = {"report_id": f'p{current["event_version"]}', "observed_version": current['event_version'],
+             "summary": "Scripted plumbing progress only",
+             "next_step": "Execute the next scripted action", "evidence_ids": current["evidence_ids"],
+             "checkpoint_ids": [c["id"] for c in checkpoints], "decision": "continue",
+             "reason": "Exercise explicit assessment without an extra model call"}
+        for call in result.message.get("tool_calls", []):
+            if call["function"]["name"] == "collaborate":
+                args = json.loads(call["function"]["arguments"])
+                args["event_version"] += 1  # report commits before this full-envelope proposal
+                args["progress"].update(progress=p["summary"], next_step=p["next_step"])
+                if args["operation"] in {"delegate", "fold", "merge"}:
+                    p["decision"] = "change"
+                call["function"]["arguments"] = json.dumps(args)
+        if not result.message.get("tool_calls"):
+            p["answer"] = result.message["content"]
+            return tool("report_progress", p)
+        record = tool("report_progress", p).message["tool_calls"][0]
+        record["id"] = "progress"
+        result.message["tool_calls"].insert(0, record)
+        return result
 
 
 def change(**proposal):
@@ -72,7 +99,7 @@ def main():
     weak = Scripted([tool("company_directory__find_email_address", {"name": "Alex"}),
                      change(operation="continue", reason="report blocked work to parent"),
                      tool("company_directory__find_email_address", {"name": "Alex"})])
-    runtime = AdaptiveRuntime(strong=strong, weak=weak, invoke=invoke, max_waves=8,
+    runtime = AdaptiveRuntime(strong=strong, weak=weak, invoke=invoke, max_waves=8, progress_checkpoints=True,
         environment_context=CONTEXT, tools=[{"type": "function", "function": {
             "name": name, "description": t["description"], "parameters": t["parameters"]}}
             for name, t in mapping.items()])
@@ -85,6 +112,8 @@ def main():
     print(json.dumps({"check": "passed", "external_api_calls": 0, "scripted_decisions": len(result["calls"]),
                       "real_sandbox_tool_calls": len(actions), "fold_then_parent_tool": True,
                       "task_completion": True, "benchmark_success": evaluation.success,
+                      "progress_checkpoints": result["metrics"]["progress_checkpoints"],
+                      "progress_assessments": result["metrics"]["progress_assessments"],
                       "note": "offline plumbing validation; not a model benchmark result"}, indent=2))
 
 

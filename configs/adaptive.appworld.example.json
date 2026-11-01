@@ -9,7 +9,7 @@
     "82e2fac_2",
     "82e2fac_3"
   ],
-  "output_dir": "/mnt/d/CALC-experiments/runs/appworld-task-progress-dev3-v2",
+  "output_dir": "/mnt/d/CALC-experiments/runs/appworld-task-progress-dev3-v3",
   "storage": {
     "APPWORLD_CACHE": "/opt/calc/cache/appworld",
     "IPYTHONDIR": "/opt/calc/cache/ipython",
@@ -32,6 +32,7 @@
     }
   },
   "runtime": {
+    "progress_checkpoints": true,
     "collaboration_mode": "full",
     "concurrency": 3,
     "max_output_tokens": 4096,

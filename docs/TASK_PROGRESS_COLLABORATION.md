@@ -1,5 +1,8 @@
 # CALC：按任务进展调整协作
 
+本页记录初版机制。后续针对首次分派与进度陈旧问题的当前实现，参见
+[进度检查点迭代](PROGRESS_CHECKPOINT_ITERATION.md)，包含 GitHub 来源、同批进度报告和新版计量语义。
+
 ## 版本与实现边界
 
 分支 `feat/task-progress-collaboration`，起点 `28e99aeda597c0b4a6303254fec2b7e9513fa081`。

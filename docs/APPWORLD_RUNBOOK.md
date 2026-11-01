@@ -1,5 +1,9 @@
 # AppWorld 运行说明（D 盘 + WSL）
 
+当前 case1 配置已升级为进度检查点版，输出到 `appworld-task-progress-case1-v2`；
+旧 v1 结果保留。已有数据锁无需重新创建。变更说明见
+[进度检查点迭代](PROGRESS_CHECKPOINT_ITERATION.md)。
+
 使用 `CALC-Research` WSL；VHD 位于 `D:\WSL\CALC-Research`，`/opt/calc` 也占 D 盘。
 Windows 官方环境在本机创建内存 SQLite 时因路径分隔符失败，所以真实执行使用 Linux。
 本机 D 盘原先只发现 AppWorld-derived 的其他项目适配器，没有原生环境或完整任务数据。

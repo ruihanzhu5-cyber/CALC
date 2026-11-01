@@ -65,3 +65,66 @@ def validate_proposal(p: dict, version: int) -> WorkReport:
     if not isinstance(p.get("evidence_ids"), list):
         raise ValueError("evidence_ids required (may be empty before observations)")
     return WorkReport.parse(p.get("progress"))
+
+
+def collection_facts(output) -> list[dict]:
+    """Describe JSON collections with distinct object IDs, not their independence.
+
+    Ordinary scalar responses and documentation without object IDs are not events.
+    Identity/order changes are factual; the model judges whether work can be split.
+    """
+    if isinstance(output, str):
+        try:
+            output = json.loads(output)
+        except (ValueError, TypeError):
+            return []  # non-JSON text has no supported structural observation
+    facts = []
+
+    def visit(value, path):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if isinstance(child, (list, dict)):
+                    visit(child, f"{path}/{key}")
+        elif isinstance(value, list) and len(value) > 1 and all(isinstance(v, dict) for v in value):
+            fields = set.intersection(*(set(v) for v in value))
+            for key in sorted(fields, key=lambda x: (x != "id", x)):
+                if key != "id" and not key.endswith("_id"):
+                    continue
+                ids = [v[key] for v in value]
+                if all(type(v) in (str, int) for v in ids) and len(set(ids)) == len(ids):
+                    facts.append({"path": path, "id_field": key, "count": len(ids),
+                                  "identity": fingerprint(sorted(ids, key=str))})
+                    break
+    visit(output, "$")
+    return facts
+
+
+def validate_subgoals(value: list[dict]) -> list[dict]:
+    if not isinstance(value, list):
+        raise ValueError("subgoals must be a list")
+    goals = {}
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"id", "goal", "status", "dependencies"}:
+            raise ValueError("subgoal requires id, goal, status, dependencies")
+        if any(not isinstance(item[k], str) or not item[k].strip() for k in ("id", "goal")):
+            raise ValueError("nonempty subgoal id and goal required")
+        if item["id"] in goals or item["status"] not in {"open", "blocked", "done"}:
+            raise ValueError("duplicate subgoal or invalid status")
+        if not isinstance(item["dependencies"], list) or any(not isinstance(d, str) for d in item["dependencies"]):
+            raise ValueError("subgoal dependencies must be IDs")
+        goals[item["id"]] = item
+    visited, visiting = set(), set()
+
+    def check(key):
+        if key not in goals or key in visiting:
+            raise ValueError("unknown or cyclic subgoal dependency")
+        if key in visited:
+            return
+        visiting.add(key)
+        for dep in goals[key]["dependencies"]:
+            check(dep)
+        visiting.remove(key)
+        visited.add(key)
+    for key in goals:
+        check(key)
+    return sorted(value, key=lambda g: g["id"])

@@ -7,7 +7,7 @@
   "task_ids": [
     "82e2fac_1"
   ],
-  "output_dir": "/mnt/d/CALC-experiments/runs/appworld-task-progress-case1-v1",
+  "output_dir": "/mnt/d/CALC-experiments/runs/appworld-task-progress-case1-v2",
   "storage": {
     "APPWORLD_CACHE": "/opt/calc/cache/appworld",
     "IPYTHONDIR": "/opt/calc/cache/ipython",
@@ -30,6 +30,7 @@
     }
   },
   "runtime": {
+    "progress_checkpoints": true,
     "collaboration_mode": "full",
     "concurrency": 3,
     "max_output_tokens": 4096,

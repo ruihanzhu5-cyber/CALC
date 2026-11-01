@@ -74,6 +74,8 @@ python -m calc run-browsecomp --config configs/browsecomp.local.json
 ## 按任务进展调整协作与 AppWorld
 
 新分支在实际 V1 AdaptiveRuntime 上实现事件触发的协作重评估、原会话继续和整个 loop 的职责交接。
+当前迭代加入[本地进度检查点与首次分派评估](docs/PROGRESS_CHECKPOINT_ITERATION.md)，
+支持进度报告与业务动作同批提交，并明确记录保持单 loop 的理由。
 参见[实现与对照设计](docs/TASK_PROGRESS_COLLABORATION.md)、[AppWorld 运行说明](docs/APPWORLD_RUNBOOK.md)。
 AppWorld 使用官方环境、train/dev 数据锁和结束后的官方评分；默认入口只做零模型调用预检。
 

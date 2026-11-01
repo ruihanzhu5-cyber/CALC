@@ -58,7 +58,9 @@ class Scripted:
 
 
 def runtime(strong=None, weak=None, **kw):
+    # Isolate existing topology contracts; test_progress_checkpoints covers the enabled protocol end to end.
     return AdaptiveRuntime(strong=strong or Scripted([]), weak=weak or Scripted([]),
+                           progress_checkpoints=kw.pop('progress_checkpoints', False),
                            tools=kw.pop('tools', []), invoke=kw.pop('invoke', lambda n, a: a), **kw)
 
 
