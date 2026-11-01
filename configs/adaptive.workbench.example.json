@@ -1,10 +1,10 @@
 {
   "manta_repo": "D:/CALC-experiments/upstreams/MANTA-native",
   "data_dir": "D:/CALC-experiments/data/workbench",
-  "output_dir": "D:/CALC-experiments/runs/calc-v1-workbench-dev1",
+  "output_dir": "D:/CALC-experiments/runs/calc-v1-workbench-flash-dev1",
   "task_ids": ["multi_domain_0"],
   "models": {
-    "strong": {"model": "deepseek-v4-pro", "base_url": "https://api.deepseek.com/v1", "key_env": "DEEPSEEK_API_KEY", "temperature": 0},
+    "strong": {"model": "deepseek-flash", "base_url": "https://api.deepseek.com/v1", "key_env": "DEEPSEEK_API_KEY", "temperature": 0},
     "weak": {"model": "deepseek-flash", "base_url": "https://api.deepseek.com/v1", "key_env": "DEEPSEEK_API_KEY", "temperature": 0}
   },
   "runtime": {"concurrency": 3, "max_output_tokens": 4096, "max_waves": null},

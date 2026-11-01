@@ -4,7 +4,9 @@ Contribution-Aware Agent Lifecycle and Context Management：面向高效多智�
 
 CALC 将“谁继续执行、把职责交给谁、接收者获得什么信息”作为一个协作决策。当前 V0 包含可安装核心、可运行生命周期闭环、BrowseComp-Plus 模型/检索入口，以及可选 POrchestra/GAIA2 适配。研究使用现成 benchmark 的任务与官方评分。
 
-2026-11-01：V1 API 运行核心已经落地，支持 Main/Worker 分派、顺序/并行/核查模板、merge、fold、职责完成解锁和强弱模型控制。[实现与运行说明](docs/CALC_V1_IMPLEMENTATION.md) · [方法框架](docs/CALC_V1_FIXED_PATTERN_API.md) · [独立代码审查](docs/CALC_V1_CODE_REVIEW_20261101.md)。首轮外部基线为作者原版 MANTA，数据选本地 WorkBench multi_domain/v1；模型使用 DeepSeek Pro/Flash。已通过离线回归和真实沙箱贯通，尚无 V1 真实模型成绩。V0 入口及历史结果保留。此前[机制调研](docs/literature/CALC_V1_TRIGGER_REVIEW_20261101.md)仍可参考，[旧训练方案](refine-logs/calc-v1-20261101/FINAL_PROPOSAL.md)已被替代。
+2026-11-01：V1 API 运行核心已经落地，支持 Main/Worker 分派、顺序/并行/核查模板、merge、fold、职责完成解锁和强弱模型控制。[实现与运行说明](docs/CALC_V1_IMPLEMENTATION.md) · [方法框架](docs/CALC_V1_FIXED_PATTERN_API.md) · [独立代码审查](docs/CALC_V1_CODE_REVIEW_20261101.md)。首轮外部基线为作者原版 MANTA，数据选本地 WorkBench multi_domain/v1；当前模型统一使用 DeepSeek Flash。已完成 Pro 单题贯通诊断，Flash 配置尚未执行；单题不构成整体效果结论。V0 入口及历史结果保留。此前[机制调研](docs/literature/CALC_V1_TRIGGER_REVIEW_20261101.md)仍可参考，[旧训练方案](refine-logs/calc-v1-20261101/FINAL_PROPOSAL.md)已被替代。
+
+当前模型配置（2026-11-01 更新）：CALC V1 的 Main、Worker、协作审批与 `escalate` 路由均使用 `deepseek-flash`，见 [运行配置](configs/adaptive.workbench.example.json)。`strong` / `weak` 保留为内部路由名称，两者现在指向同一 Flash 模型。此前 Pro 单题日志保留原始模型标记；切换后的 Flash 配置尚未执行。
 
 ## 方法闭环
 
