@@ -10,6 +10,21 @@ import threading
 import time
 
 
+def select_tasks(ids, methods=None, tasks=None, plan=None):
+    if plan is not None:
+        if methods or tasks or not isinstance(plan, dict) or not plan:
+            raise ValueError('Recovery plan must be an explicit method/task mapping without overrides')
+        selected = plan
+    else:
+        selected = {method: tasks or ids for method in methods or ['calc', 'manta']}
+    for method, subset in selected.items():
+        if method not in {'calc', 'manta'} or not isinstance(subset, list) or not subset:
+            raise ValueError('Invalid method or empty task subset')
+        if len(set(subset)) != len(subset) or not set(subset) <= set(ids):
+            raise ValueError('Explicit task subset must contain unique locked task IDs')
+    return selected
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--config', required=True, type=Path)
@@ -17,13 +32,12 @@ def main():
     p.add_argument('--methods', nargs='+', choices=['calc', 'manta'])
     p.add_argument('--tasks', nargs='+')
     p.add_argument('--queue-name')
+    p.add_argument('--plan', type=Path, help='Explicit method-to-task recovery mapping; never selects by score')
     args = p.parse_args()
     config = json.loads(args.config.read_text())
     ids = json.loads(Path(config['task_lock']).read_text())['task_ids']
-    if args.tasks:
-        if len(set(args.tasks)) != len(args.tasks) or not set(args.tasks) <= set(ids):
-            raise ValueError('Explicit task subset must contain unique locked task IDs')
-        ids = args.tasks
+    selected = select_tasks(ids, args.methods if args.execute or args.methods else ['calc'], args.tasks,
+                            json.loads(args.plan.read_text()) if args.plan else None)
     root = Path(config['output_dir'])
     root.mkdir(parents=True, exist_ok=True)
     phase = 'execute' if args.execute else 'preflight'
@@ -34,16 +48,16 @@ def main():
     if args.execute and status_path.exists():
         raise FileExistsError('refusing to restart an existing paid batch')
     lock = threading.Lock()
-    methods = args.methods or (['calc', 'manta'] if args.execute else ['calc'])
+    methods = list(selected)
     state = {'pid': os.getpid(), 'phase': phase,
-             'tasks': {method + '/' + task: {'status': 'queued'} for method in methods for task in ids},
+             'tasks': {method + '/' + task: {'status': 'queued'} for method in methods for task in selected[method]},
              'heartbeat': time.time()}
     def save():
         temp = status_path.with_suffix('.tmp')
         temp.write_text(json.dumps(state, indent=2))
         temp.replace(status_path)
     def method_worker(method):
-        for task in ids:
+        for task in selected[method]:
             cmd = [sys.executable, '-B', str(Path(__file__).with_name('run_gaia2_pilot.py')),
                 '--config', str(args.config), '--method', method, '--task', task]
             if args.execute:
