@@ -1,0 +1,45 @@
+{
+  "calc_git_dir": "/mnt/d/CALC-experiments/code/CALC/.git/worktrees/CALC-task-progress",
+  "appworld_repo": "/mnt/d/CALC-experiments/upstreams/appworld",
+  "appworld_root": "/mnt/d/CALC-experiments/data/appworld",
+  "data_lock": "/mnt/d/CALC-experiments/configs/appworld-case1-v2.lock.json",
+  "split": "train",
+  "task_ids": [
+    "82e2fac_1"
+  ],
+  "output_dir": "/mnt/d/CALC-experiments/runs/appworld-task-progress-case1-v1",
+  "storage": {
+    "APPWORLD_CACHE": "/opt/calc/cache/appworld",
+    "IPYTHONDIR": "/opt/calc/cache/ipython",
+    "TEMP": "/opt/calc/tmp",
+    "TMP": "/opt/calc/tmp",
+    "TMPDIR": "/opt/calc/tmp"
+  },
+  "models": {
+    "strong": {
+      "model": "deepseek-flash",
+      "base_url": "https://api.deepseek.com/v1",
+      "key_env": "DEEPSEEK_API_KEY",
+      "temperature": 0
+    },
+    "weak": {
+      "model": "deepseek-flash",
+      "base_url": "https://api.deepseek.com/v1",
+      "key_env": "DEEPSEEK_API_KEY",
+      "temperature": 0
+    }
+  },
+  "runtime": {
+    "collaboration_mode": "full",
+    "concurrency": 3,
+    "max_output_tokens": 4096,
+    "max_waves": null
+  },
+  "environment": {
+    "max_interactions": 1000,
+    "max_api_calls_per_interaction": 5000,
+    "random_seed": 100,
+    "timeout_seconds": 100,
+    "raise_on_extra_parameters": true
+  }
+}

@@ -71,6 +71,12 @@ python -m calc run-browsecomp --config configs/browsecomp.local.json
 
 本轮验证范围是离线行为和HTTP协议。真实模型、检索索引与官方judge运行属于下一批实验。正式实验的模型、数据、资源、训练与评价约定见 [研究协议](docs/RESEARCH_PROTOCOL.md)。
 
+## 按任务进展调整协作与 AppWorld
+
+新分支在实际 V1 AdaptiveRuntime 上实现事件触发的协作重评估、原会话继续和整个 loop 的职责交接。
+参见[实现与对照设计](docs/TASK_PROGRESS_COLLABORATION.md)、[AppWorld 运行说明](docs/APPWORLD_RUNBOOK.md)。
+AppWorld 使用官方环境、train/dev 数据锁和结束后的官方评分；默认入口只做零模型调用预检。
+
 ## D盘代码备份
 
 开发交付同时同步到 `D:\CALC`。备份含代码、文档、配置和测试，并写入文件哈希清单；模型数据、依赖环境、密钥和运行日志留在各自目录。开发工作区可以再次同步：
