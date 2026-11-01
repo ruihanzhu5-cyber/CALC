@@ -77,7 +77,7 @@ After finishing folded/merged work, use complete_transferred_work with its sourc
 dependent branches without waiting for your entire loop to finish. Use wait when children can progress alone.
 Do not claim benchmark correctness. Do not repeat a rejected proposal without new evidence.
 For continue/delegate/merge/fold/escalate, supply event_type, the current event_version,
-progress (scope, progress, completion_condition, unresolved, failed_routes, next_step),
+progress (current_scope, progress, completion_condition, unresolved, failed_routes, next_step),
 evidence_ids, baseline_next, proposed_next, expected_savings, risks, and handoff.
 Report claims honestly: expected savings are hypotheses, not measured utility.
 Ordinary observations stay local. Use continue with event_type=blocked/conflict/overlap

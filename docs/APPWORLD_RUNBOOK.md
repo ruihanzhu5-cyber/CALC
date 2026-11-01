@@ -92,7 +92,7 @@ $env:TMP=$env:TEMP
 ## 本轮验证记录
 
 - 状态机与 AppWorld 隔离单测 28 项通过，含父节点提前答复时保留待审批请求的决策机会。
-- WSL 完整回归 137 项通过；随后新增上述防死锁测试并通过相关 28 项测试。
+- 最终 WSL 完整回归 138 项通过；相关 28 项状态机/适配器测试及 Ruff 检查通过。
   Windows 初次 CLI 子进程因未安装新 worktree 模块路径失败，设置 PYTHONPATH=src 后通过。
 - WorkBench 离线贯通通过：8 个脚本决策、3 次真实业务工具，fold 后父节点执行；
   故意未完成业务任务，官方适配评分为 false。零外部模型请求。
@@ -101,3 +101,5 @@ $env:TMP=$env:TEMP
 - WSL 原生预检已通过：`appworld-task-progress-case1-v1/full/preflight`，模型请求 0，
   真实初始化、文档 API、保存和官方评分耗时 24.409 秒。只查文档未做题，官方 success=false 是预期值。
   不能把该预检当成模型成绩；真实单题结果以 execute 目录和本次运行报告为准。
+- Flash 单题已完成，官方成功 1/1，15 请求、161160 Token；详见
+  [真实单题运行记录](APPWORLD_CASE1_20261101.md)。未自动启动下一题。
