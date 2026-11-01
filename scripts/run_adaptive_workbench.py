@@ -17,6 +17,7 @@ from dataclasses import asdict
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from calc.adaptive import AdaptiveRuntime  # noqa: E402
 from calc.llm import OpenAICompatibleClient  # noqa: E402
+from calc.progress import MODES, allowed_operations  # noqa: E402
 
 PIN = "3da40879d690a25459cc401292e5c6f0cc366d84"
 CONTEXT = ("Today's date is Thursday, 2023-11-30 and the current time is 00:00:00. "
@@ -48,8 +49,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--mode", choices=sorted(MODES))
     args = parser.parse_args()
     cfg = json.loads(args.config.read_text(encoding="utf-8-sig"))
+    if args.mode:
+        cfg["runtime"]["collaboration_mode"] = args.mode
+    mode = cfg["runtime"].get("collaboration_mode", "full")
     benchmark, sandbox_type, format_call, hashes = load_benchmark(Path(cfg["manta_repo"]), Path(cfg["data_dir"]))
     tasks = {t.task_id: t for t in benchmark.load_tasks()}
     ids = cfg["task_ids"]
@@ -63,8 +68,10 @@ def main() -> int:
                 "scoring": "pinned MANTA WorkBench state-change evaluator", "model_requests": 0}
     root = Path(__file__).resolve().parents[1]
     manifest["calc_source_sha256"] = {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in
-        ["src/calc/adaptive.py", "src/calc/llm.py", "scripts/run_adaptive_workbench.py"]}
+        ["src/calc/adaptive.py", "src/calc/progress.py", "src/calc/llm.py", "scripts/run_adaptive_workbench.py"]}
     manifest["skills"] = cfg.get("skills", {})
+    manifest["allowed_initial_operations"] = sorted(allowed_operations(mode, True, True))
+    manifest["allowed_later_operations"] = sorted(allowed_operations(mode, False, True))
     if not args.execute:
         # Exercise the real evaluator with an empty prediction, not a fake success.
         first = tasks[ids[0]]
@@ -82,7 +89,7 @@ def main() -> int:
             raise ValueError(f"missing credential environment variable for {tier}")
         clients[tier] = OpenAICompatibleClient(spec["base_url"], spec["model"], key,
                                               temperature=spec.get("temperature"))
-    output = Path(cfg["output_dir"])
+    output = Path(cfg["output_dir"]) / mode
     output.mkdir(parents=True, exist_ok=False)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     summaries = []
@@ -123,7 +130,8 @@ def main() -> int:
                 run_metadata={"function_calls": actions, "error": ""})
             # Preserve native state score separately from completion; do not redefine correctness.
             row = {"task_id": task_id, "completion": result["status"] == "answered",
-                   "success": evaluation.success, "status": result["status"], "usage": result["usage"]}
+                   "success": evaluation.success, "status": result["status"], "usage": result["usage"],
+                   "metrics": result.get("metrics"), "elapsed_seconds": result.get("elapsed_seconds")}
             (task_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
             (task_dir / "evaluation.json").write_text(json.dumps(asdict(evaluation), ensure_ascii=False, indent=2), encoding="utf-8")
             summaries.append(row)

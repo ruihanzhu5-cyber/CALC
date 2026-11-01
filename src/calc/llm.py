@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -63,6 +63,7 @@ class OpenAICompatibleClient:
         temperature: float | None = None,
         reasoning_effort: str | None = None,
         extra_body: dict[str, Any] | None = None,
+        clock: Callable[[], float] = perf_counter,
     ) -> None:
         if output_token_field not in {"max_tokens", "max_completion_tokens"}:
             raise ValueError("output_token_field must be max_tokens or max_completion_tokens")
@@ -73,6 +74,7 @@ class OpenAICompatibleClient:
         self.temperature = temperature
         self.reasoning_effort = reasoning_effort
         self.extra_body = dict(extra_body or {})
+        self.clock = clock
         if {"model", "messages", "tools", "stream", "max_tokens", "max_completion_tokens"} & self.extra_body.keys():
             raise ValueError("extra_body cannot override protocol or budget fields")
         self.client = client or httpx.Client(timeout=timeout)
@@ -98,7 +100,7 @@ class OpenAICompatibleClient:
         if tools:
             body.update(tools=tools, tool_choice="auto")
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-        started = perf_counter()
+        started = self.clock()
         response = self.client.post(f"{self.base_url}/chat/completions", json=body, headers=headers)
         response.raise_for_status()
         data = response.json()
@@ -112,7 +114,7 @@ class OpenAICompatibleClient:
         message["role"] = "assistant"
         return ChatResponse(
             message, choice.get("finish_reason"), Usage.from_response(data.get("usage")),
-            perf_counter() - started, data.get("id"),
+            self.clock() - started, data.get("id"),
         )
 
     def close(self) -> None:

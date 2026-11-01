@@ -28,8 +28,23 @@ class Scripted:
     def __init__(self, responses):
         self.responses = iter(responses)
 
-    def complete(self, *args, **kwargs):
-        return next(self.responses)
+    def complete(self, messages, **kwargs):
+        item = next(self.responses)
+        return item(messages) if callable(item) else item
+
+
+def change(**proposal):
+    def decision(messages):
+        system = messages[0]["content"]
+        actor = system.split("You are ")[1].split(".")[0]
+        state = json.loads(system.split("Current team state: ")[1].split("\n")[0])
+        current = next(a for a in state if a["id"] == actor)
+        return tool("collaborate", {"event_type": "blocked", "event_version": current["event_version"],
+            "progress": current["work"], "evidence_ids": current["evidence_ids"],
+            "baseline_next": "worker continues directory lookup", "proposed_next": "parent continues lookup",
+            "expected_savings": "test transfer without another worker loop", "risks": "lose independent context",
+            "handoff": "preserve raw tool evidence and history", **proposal})
+    return decision
 
 
 def main():
@@ -48,13 +63,14 @@ def main():
         return spec["handler"](arguments)
 
     strong = Scripted([
-        tool("collaborate", {"operation": "delegate", "pattern": "parallel", "reason": "exercise isolation",
-                             "branches": [{"goal": "Read directory records for Alex"}]}),
-        tool("collaborate", {"operation": "fold", "sources": ["agent_1"], "receiver": "main",
-                             "reason": "exercise parent continuation"}),
+        change(operation="delegate", pattern="parallel", reason="exercise isolation",
+               branches=[{"goal": "Read directory records for Alex"}]),
+        change(operation="fold", sources=["agent_1"], receiver="main", reason="exercise parent continuation"),
         tool("company_directory__find_email_address", {"name": "Alex"}),
+        tool("complete_transferred_work", {"source": "agent_1", "result": "Directory lookup completed"}),
         answer("Offline plumbing check finished; requested benchmark changes were not performed.")])
     weak = Scripted([tool("company_directory__find_email_address", {"name": "Alex"}),
+                     change(operation="continue", reason="report blocked work to parent"),
                      tool("company_directory__find_email_address", {"name": "Alex"})])
     runtime = AdaptiveRuntime(strong=strong, weak=weak, invoke=invoke, max_waves=8,
         environment_context=CONTEXT, tools=[{"type": "function", "function": {
