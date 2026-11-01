@@ -70,3 +70,14 @@ export XDG_CACHE_HOME=/opt/calc/cache PYTHONDONTWRITEBYTECODE=1
 依赖版本见 `configs/gaia2.environment.freeze.txt`。
 后台入口为 `scripts/run_gaia2_durable.ps1`，通过 Windows 计划任务独立运行 WSL；
 执行队列或启动回执已存在时拒绝重启，防止重复付费。
+
+## 首次执行的传输兼容修正
+
+MANTA 首题在原 `MAS/llm.py` 重复工具调用提前终止路径中留下尚未执行的 tool_call_id，
+原 `_force_final_response` 请求被 DeepSeek 以 HTTP 400 拒绝。该次结果为基础设施失败，
+不能作为 MANTA 任务能力失败的证据；原轨迹、165154 个已报告 Token 和1次未知 usage 保留。
+新增 `manta_transport.py` 仅在原生强制终答请求中给未配对 ID 补充真实的 `not_executed` 状态，
+不执行剩余工具、不提供虚构结果、不改变作者的拓扑或早停规则；每次协议补齐单独写事件。
+非该路径的协议错误仍直接报错，不额外调用模型。163 项回归及 Ruff 通过。
+四个尚未尝试的 MANTA 任务使用显式子队列 `manta_remaining_queue.json` 继续，
+首题不在该子队列内；原队列的四个 queued 条目应结合子队列解读，不可重复启动。

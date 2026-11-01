@@ -14,17 +14,27 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--config', required=True, type=Path)
     p.add_argument('--execute', action='store_true')
+    p.add_argument('--methods', nargs='+', choices=['calc', 'manta'])
+    p.add_argument('--tasks', nargs='+')
+    p.add_argument('--queue-name')
     args = p.parse_args()
     config = json.loads(args.config.read_text())
     ids = json.loads(Path(config['task_lock']).read_text())['task_ids']
+    if args.tasks:
+        if len(set(args.tasks)) != len(args.tasks) or not set(args.tasks) <= set(ids):
+            raise ValueError('Explicit task subset must contain unique locked task IDs')
+        ids = args.tasks
     root = Path(config['output_dir'])
     root.mkdir(parents=True, exist_ok=True)
     phase = 'execute' if args.execute else 'preflight'
-    status_path = root / (phase + '_queue.json')
+    queue_name = args.queue_name or (phase + '_queue.json')
+    if Path(queue_name).name != queue_name:
+        raise ValueError('Queue name must be a filename')
+    status_path = root / queue_name
     if args.execute and status_path.exists():
         raise FileExistsError('refusing to restart an existing paid batch')
     lock = threading.Lock()
-    methods = ['calc', 'manta'] if args.execute else ['calc']
+    methods = args.methods or (['calc', 'manta'] if args.execute else ['calc'])
     state = {'pid': os.getpid(), 'phase': phase,
              'tasks': {method + '/' + task: {'status': 'queued'} for method in methods for task in ids},
              'heartbeat': time.time()}

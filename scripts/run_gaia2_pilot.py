@@ -21,6 +21,7 @@ from calc.adaptive import AdaptiveRuntime  # noqa: E402
 from calc.benchmarks.gaia2 import (Gaia2Adapter, JudgeEngine, ClockedClient,  # noqa: E402
                                    ARE_COMMIT, MANTA_COMMIT, PUBLIC_CONTEXT)
 from calc.llm import OpenAICompatibleClient, Usage, aggregate_usage  # noqa: E402
+from calc.benchmarks.manta_transport import close_native_cancelled_calls  # noqa: E402
 
 
 def write(path, value):
@@ -54,7 +55,9 @@ def manta_runner(cfg, adapter, emit):
     class Completions:
         def create(self, **kwargs):
             body = dict(kwargs)
-            messages = [dict(m) for m in body["messages"]]
+            messages, cancelled = close_native_cancelled_calls(body["messages"])
+            for item in cancelled:
+                emit({"event": "native_tool_call_cancelled", **item})
             messages.append({"role": "user", "content": "Current public environment updates:\n" + adapter.public_snapshot()})
             body["messages"] = messages
             # OpenRouter routing fields have no meaning on the official DeepSeek endpoint.
@@ -113,7 +116,8 @@ def main():
     write(output / "manifest.json", {"config": cfg, "method": args.method, "task_id": args.task,
         "are_commit": ARE_COMMIT, "manta_commit": MANTA_COMMIT, "data_lock": lock,
         "source_sha256": {str(f.relative_to(ROOT)): hashlib.sha256(f.read_bytes()).hexdigest()
-            for f in [Path(__file__), ROOT / 'src/calc/adaptive.py', ROOT / 'src/calc/benchmarks/gaia2.py']},
+            for f in [Path(__file__), ROOT / 'src/calc/adaptive.py', ROOT / 'src/calc/benchmarks/gaia2.py',
+                      ROOT / 'src/calc/benchmarks/manta_transport.py']},
         "preflight": not args.execute})
     started = time.perf_counter()
     adapter, actor_client, judge_client, manta_http = None, None, None, None
