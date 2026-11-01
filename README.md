@@ -4,7 +4,7 @@ Contribution-Aware Agent Lifecycle and Context Management：面向高效多智�
 
 CALC 将“谁继续执行、把职责交给谁、接收者获得什么信息”作为一个协作决策。当前 V0 包含可安装核心、可运行生命周期闭环、BrowseComp-Plus 模型/检索入口，以及可选 POrchestra/GAIA2 适配。研究使用现成 benchmark 的任务与官方评分。
 
-2026-11-01 的 V1 方法调研与设计已保存：[最新机制调研](docs/literature/CALC_V1_TRIGGER_REVIEW_20261101.md) · [V1 方法方案](refine-logs/calc-v1-20261101/FINAL_PROPOSAL.md)。V1 聚焦学习具体协作干预相对原样继续的质量/成本增益，支持 Main/Worker 分派与任务驱动的团队结构；第一轮比较收敛为 CLM + BrowseComp-Plus + DeepSeek Flash。该交付目前是方法设计，尚未替换下述 V0 运行代码或产生 V1 分数。
+2026-11-01：V1 API 运行核心已经落地，支持 Main/Worker 分派、顺序/并行/核查模板、merge、fold、职责完成解锁和强弱模型控制。[实现与运行说明](docs/CALC_V1_IMPLEMENTATION.md) · [方法框架](docs/CALC_V1_FIXED_PATTERN_API.md) · [独立代码审查](docs/CALC_V1_CODE_REVIEW_20261101.md)。首轮外部基线为作者原版 MANTA，数据选本地 WorkBench multi_domain/v1；模型使用 DeepSeek Pro/Flash。已通过离线回归和真实沙箱贯通，尚无 V1 真实模型成绩。V0 入口及历史结果保留。此前[机制调研](docs/literature/CALC_V1_TRIGGER_REVIEW_20261101.md)仍可参考，[旧训练方案](refine-logs/calc-v1-20261101/FINAL_PROPOSAL.md)已被替代。
 
 ## 方法闭环
 
@@ -51,6 +51,8 @@ python -m calc run-browsecomp --config configs/browsecomp.local.json
 真实运行需要可用模型 API、与 benchmark 一致的检索语料及服务，以及公开任务数据。该命令可能产生模型和检索费用，安装、单元测试和 `demo` 不要求付费模型调用。终局评分按 benchmark 官方流程单独执行，运行日志或格式正确的结果文件不能替代官方得分。
 
 ## 基线与研究顺序
+
+最新 V1 以 [MANTA 本机核查](docs/MANTA_LOCAL_AUDIT_20261101.md)和[实现说明](docs/CALC_V1_IMPLEMENTATION.md)为准。下面保留 V0 的历史接入顺序，不代表本轮需重跑这些基线。
 
 工作顺序为：**复现最新强基线 → 建立 CALC 方法闭环 → 接入真实任务 → 按证据迭代。**
 
