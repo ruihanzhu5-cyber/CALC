@@ -1,4 +1,4 @@
-"""Durable two-method supervisor. Five fixed tasks each, one attempt per task."""
+"""Durable two-method supervisor. Explicit locked tasks, one attempt per task."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json

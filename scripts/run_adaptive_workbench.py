@@ -10,40 +10,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 from dataclasses import asdict
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from calc.adaptive import AdaptiveRuntime  # noqa: E402
+from calc.benchmarks.session import adaptive_runtime  # noqa: E402
+from calc.benchmarks.workbench import WorkBenchAdapter, load_benchmark, PIN  # noqa: E402
 from calc.llm import OpenAICompatibleClient  # noqa: E402
 from calc.progress import MODES, allowed_operations  # noqa: E402
-
-PIN = "3da40879d690a25459cc401292e5c6f0cc366d84"
-CONTEXT = ("Today's date is Thursday, 2023-11-30 and the current time is 00:00:00. "
-           "Meetings must not start before 9am or end after 6pm. Use workplace tools to complete the task. "
-           "After using tools, provide a brief natural-language confirmation. All tools act on a local sandbox. ")
-
-
-def load_benchmark(repo: Path, data: Path):
-    commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-    if commit != PIN:
-        raise ValueError(f"expected pinned MANTA commit {PIN}")
-    dirty = subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"], text=True)
-    if dirty.strip():
-        raise ValueError("pinned MANTA tracked files have local modifications")
-    sys.path.insert(0, str(repo.resolve()))
-    from benchmark.workbench import WorkBenchBenchmark, WorkBenchSandbox, DATA_FILES, QUERY_FILE_NAMES
-    from benchmark.workbench import _format_function_call
-    files = [*DATA_FILES, *[f"data/processed/tasks_and_outcomes/v1/{f}" for f in QUERY_FILE_NAMES.values()]]
-    missing = [f for f in files if not (data / f).is_file()]
-    if missing:
-        raise FileNotFoundError(f"local assets missing (no auto-download): {missing}")
-    benchmark = WorkBenchBenchmark({"data_dir": str(data), "domain": "multi_domain",
-                                    "tasks_version": "v1", "tool_selection": "domains"})
-    hashes = {f: hashlib.sha256((data / f).read_bytes()).hexdigest() for f in files}
-    return benchmark, WorkBenchSandbox, _format_function_call, hashes
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -68,14 +42,22 @@ def main() -> int:
                 "scoring": "pinned MANTA WorkBench state-change evaluator", "model_requests": 0}
     root = Path(__file__).resolve().parents[1]
     manifest["calc_source_sha256"] = {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in
-        ["src/calc/adaptive.py", "src/calc/progress.py", "src/calc/llm.py", "scripts/run_adaptive_workbench.py"]}
+        ["src/calc/adaptive.py", "src/calc/progress.py", "src/calc/llm.py", "scripts/run_adaptive_workbench.py",
+         "src/calc/benchmarks/session.py", "src/calc/benchmarks/workbench.py"]}
     manifest["skills"] = cfg.get("skills", {})
     manifest["allowed_initial_operations"] = sorted(allowed_operations(mode, True, True))
     manifest["allowed_later_operations"] = sorted(allowed_operations(mode, False, True))
     if not args.execute:
         # Exercise the real evaluator with an empty prediction, not a fake success.
         first = tasks[ids[0]]
-        evaluation = benchmark.evaluate(first, "", run_metadata={"function_calls": [], "error": "preflight_only"})
+        adapter = WorkBenchAdapter(benchmark, sandbox_type, format_call, Path(cfg['data_dir']), first)
+        session = adapter.session()
+        try:
+            json.dumps(session.actor_environment().tools)
+            session.finish()
+            evaluation = session.evaluate('')
+        finally:
+            session.close()
         print(json.dumps({"preflight": "passed", "available_tasks": len(tasks),
                           "empty_attempt_success": evaluation.success, **manifest}, indent=2))
         return 0
@@ -96,17 +78,8 @@ def main() -> int:
     try:
         for task_id in ids:
             task = tasks[task_id]
-            sandbox = sandbox_type(Path(cfg["data_dir"]))
-            tools = benchmark._build_tools(sandbox, list(task.metadata["domains"]))
-            mapping = {t["name"].replace(".", "__"): t for t in tools}
-            schemas = [{"type": "function", "function": {"name": name, "description": t["description"],
-                        "parameters": t["parameters"]}} for name, t in mapping.items()]
-            actions = []
-
-            def invoke(name, arguments):
-                tool = mapping[name]
-                actions.append(format_call(tool["name"], arguments))
-                return tool["handler"](arguments)
+            adapter = WorkBenchAdapter(benchmark, sandbox_type, format_call, Path(cfg['data_dir']), task)
+            session = adapter.session()
 
             task_dir = output / task_id
             task_dir.mkdir()
@@ -115,19 +88,21 @@ def main() -> int:
                     trace.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
                     trace.flush()
 
-                runtime = AdaptiveRuntime(strong=clients["strong"], weak=clients["weak"], tools=schemas,
-                    invoke=invoke, skills=cfg.get("skills", {}), event_sink=emit,
-                    environment_context=CONTEXT, **cfg["runtime"])
+                runtime = adaptive_runtime(session.actor_environment(), strong=clients["strong"],
+                    weak=clients["weak"], skills=cfg.get("skills", {}), event_sink=emit, options=cfg['runtime'])
                 # Only task text is passed, never metadata.answer or templates.
                 try:
-                    result = runtime.run(str(task.prompt))
+                    result = runtime.run(adapter.instruction)
                 except Exception as exc:
                     from calc.llm import aggregate_usage
                     result = {"answer": "", "status": "runtime_error", "error_type": type(exc).__name__,
                               "calls": runtime.calls, "events": runtime.events,
                               "usage": aggregate_usage(runtime.calls), "correctness": "not_evaluated"}
-            evaluation = benchmark.evaluate(task, result["answer"],
-                run_metadata={"function_calls": actions, "error": ""})
+            try:
+                session.finish()
+                evaluation = session.evaluate(result['answer'])
+            finally:
+                session.close()
             # Preserve native state score separately from completion; do not redefine correctness.
             row = {"task_id": task_id, "completion": result["status"] == "answered",
                    "success": evaluation.success, "status": result["status"], "usage": result["usage"],

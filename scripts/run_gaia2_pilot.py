@@ -13,11 +13,12 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from calc.adaptive import AdaptiveRuntime  # noqa: E402
+from calc.benchmarks.session import adaptive_runtime  # noqa: E402
 from calc.benchmarks.gaia2 import (Gaia2Adapter, JudgeEngine, ClockedClient,  # noqa: E402
                                    ARE_COMMIT, MANTA_COMMIT, PUBLIC_CONTEXT)
 from calc.llm import OpenAICompatibleClient, Usage, aggregate_usage  # noqa: E402
@@ -54,6 +55,7 @@ def manta_runner(cfg, adapter, emit):
 
     class Completions:
         def create(self, **kwargs):
+            request_id, started = uuid.uuid4().hex, time.perf_counter()
             body = dict(kwargs)
             messages, cancelled = close_native_cancelled_calls(body["messages"])
             for item in cancelled:
@@ -65,16 +67,20 @@ def manta_runner(cfg, adapter, emit):
             extra.pop("provider", None)
             extra.pop("models", None)
             body["extra_body"] = extra
+            emit({"event": "actor_input", "request_id": request_id, "messages": messages,
+                  "tools": body.get("tools", []), "model": body.get("model")})
             adapter.begin_request()
             try:
                 result = http_client.chat.completions.create(**body)
-                emit({"event": "actor_request", "usage": Usage.from_response(
+                emit({"event": "actor_request", "request_id": request_id,
+                    "elapsed_seconds": time.perf_counter() - started, "usage": Usage.from_response(
                     result.usage.model_dump() if result.usage else None).to_dict(),
                     "finish_reason": result.choices[0].finish_reason,
                     "message": result.choices[0].message.model_dump()})
                 return result
             except Exception as exc:
-                emit({"event": "actor_request", "usage": {}, "error": type(exc).__name__})
+                emit({"event": "actor_request", "request_id": request_id,
+                      "elapsed_seconds": time.perf_counter() - started, "usage": {}, "error": type(exc).__name__})
                 raise
             finally:
                 adapter.end_request()
@@ -96,7 +102,7 @@ def main():
     verify(cfg["manta_repo"], MANTA_COMMIT)
     lock = json.loads(Path(cfg["task_lock"]).read_text())
     if args.task not in lock["task_ids"]:
-        raise ValueError("task is not in the fixed five-case manifest")
+        raise ValueError("task is not in the fixed case manifest")
     path = Path(cfg["task_dir"]) / (args.task + ".json")
     if hashlib.sha256(path.read_bytes()).hexdigest() != lock["sha256"][path.name]:
         raise ValueError("task hash mismatch")
@@ -117,10 +123,11 @@ def main():
         "are_commit": ARE_COMMIT, "manta_commit": MANTA_COMMIT, "data_lock": lock,
         "source_sha256": {str(f.relative_to(ROOT)): hashlib.sha256(f.read_bytes()).hexdigest()
             for f in [Path(__file__), ROOT / 'src/calc/adaptive.py', ROOT / 'src/calc/benchmarks/gaia2.py',
-                      ROOT / 'src/calc/benchmarks/manta_transport.py']},
+                      ROOT / 'src/calc/benchmarks/manta_transport.py', ROOT / 'src/calc/progress.py',
+                      ROOT / 'src/calc/benchmarks/session.py']},
         "preflight": not args.execute})
     started = time.perf_counter()
-    adapter, actor_client, judge_client, manta_http = None, None, None, None
+    adapter, actor_client, judge_client, manta_http, session = None, None, None, None, None
     try:
         if args.execute:
             judge_client = OpenAICompatibleClient(cfg["base_url"], cfg["model"],
@@ -129,6 +136,8 @@ def main():
             raise RuntimeError("preflight attempted an unauthorized model request")
         judge = JudgeEngine(judge_client, emit) if args.execute else no_model
         adapter = Gaia2Adapter(path, judge, emit, preflight=not args.execute)
+        session = adapter.session()
+        public = session.actor_environment()
         initial = adapter.wait_events()
         if not initial:
             raise RuntimeError("environment ended without initial public request")
@@ -139,16 +148,33 @@ def main():
                 raise RuntimeError("no read-only tool catalog")
             # No arbitrary mutation or model call; verify schema serialization and MANTA imports.
             json.dumps(adapter.tools)
-            adapter.invoke("SystemApp__get_current_time", {})
+            public.invoke("SystemApp__get_current_time", {})
             sys.path.insert(0, cfg["manta_repo"])
             from MAS.config import load_experiment_config
             native_cfg = load_experiment_config(cfg["manta_config"])
             native_cfg.validate()
+            probes = []
+            if cfg.get("preflight_public_records", False):
+                # Inspect public catalog entries in this disposable preflight world.
+                # No oracle, judge output or data from here is reused in paid runs.
+                catalog = public.invoke("Shopping__list_all_products", {"limit": 1})
+                product_id = next(iter(catalog["products"].values()))
+                record = public.invoke("Shopping__get_product_details", {"product_id": product_id})
+                if not isinstance(record, dict) or record["product_id"] != product_id:
+                    raise RuntimeError("public product fields lost at adapter boundary")
+                from MAS.llm import OpenRouterLLMClient
+                compactor = object.__new__(OpenRouterLLMClient)
+                compact = compactor._compact_tool_output_for_prompt(record, preview_chars=160)
+                if compact != record:
+                    raise RuntimeError("native MANTA compaction changed preflight public record")
+                probes.append({"tool": "Shopping__get_product_details", "typed_record": True,
+                               "native_manta_fields_preserved": True})
             write(output / "preflight.json", {"status": "passed", "model_requests": 0,
                 "tools": len(adapter.tools), "notifications": len(initial),
                 "native_topology": native_cfg.mas.topology,
                 "repair_budget": native_cfg.self_evolved.repair_budget,
                 "max_turns": native_cfg.self_evolved.max_turns,
+                "public_record_probes": probes,
                 "note": "Environment/schema/import preflight only; no benchmark score"})
             return
         instruction = PUBLIC_CONTEXT + "\n" + json.dumps(initial, ensure_ascii=False)
@@ -156,17 +182,16 @@ def main():
             actor_client = OpenAICompatibleClient(cfg["base_url"], cfg["model"],
                 os.environ["DEEPSEEK_API_KEY"], temperature=0, timeout=600)
             client = ClockedClient(actor_client, adapter, emit)
-            runtime = AdaptiveRuntime(strong=client, weak=client, tools=adapter.tools,
-                invoke=adapter.invoke, external_events=adapter.pending,
+            runtime = adaptive_runtime(public, strong=client, weak=client,
                 event_sink=lambda e: emit({**e, "runtime_event": True}),
-                environment_context=PUBLIC_CONTEXT, **cfg["runtime"])
+                options=cfg['runtime'])
         else:
             runner, manta_http = manta_runner(cfg, adapter, emit)
             tools = [{"name": t["function"]["name"], "description": t["function"]["description"],
                       "parameters": t["function"]["parameters"],
                       "side_effect": bool(adapter.app_tools[t["function"]["name"]].write_operation),
-                      "handler": lambda a, name=t["function"]["name"]: adapter.invoke(name, a)}
-                     for t in adapter.tools]
+                      "handler": lambda a, name=t["function"]["name"]: public.invoke(name, a)}
+                     for t in public.tools]
         turns = []
         while not adapter.stopped():
             before = adapter.sent
@@ -184,14 +209,15 @@ def main():
             if not answer:
                 raise RuntimeError("actor ended without an answer")
             if adapter.sent == before and not adapter.stopped():
-                adapter.invoke("AgentUserInterface__send_message_to_user", {"content": answer})
+                public.invoke("AgentUserInterface__send_message_to_user", {"content": answer})
             if adapter.scenario.nb_turns is not None and adapter.sent >= adapter.scenario.nb_turns:
                 break
             events = adapter.wait_events()
             if not events:
                 break
             instruction = PUBLIC_CONTEXT + "\nNew user/environment turn:\n" + json.dumps(events, ensure_ascii=False)
-        evaluation = adapter.evaluate()
+        session.finish()
+        evaluation = session.evaluate(turns[-1] if turns else '')
         write(output / "evaluation.json", asdict(evaluation))
         write(output / "result.json", {"status": "completed", "answers": turns,
             "success": evaluation.success, "wall_seconds": time.perf_counter() - started,
@@ -208,7 +234,10 @@ def main():
             exported = JsonScenarioExporter().export_to_json(env=adapter.env,
                 scenario=adapter.scenario, scenario_id=args.task, runner_config=None)
             (output / "official_trace.json").write_text(exported, encoding="utf-8")
-            adapter.close()
+            if session is not None:
+                session.close()
+            else:
+                adapter.close()
         for client in (actor_client, judge_client, manta_http):
             if client:
                 client.close()

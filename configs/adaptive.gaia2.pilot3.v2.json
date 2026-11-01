@@ -1,0 +1,15 @@
+{
+  "are_repo": "/mnt/d/CALC-experiments/upstreams/ARE",
+  "manta_repo": "/mnt/d/CALC-experiments/upstreams/MANTA-native",
+  "manta_config": "/mnt/d/CALC-experiments/code/CALC-task-progress/configs/manta.gaia2.paper.toml",
+  "task_dir": "/mnt/d/CALC-experiments/data/gaia2/pilot5",
+  "task_lock": "/mnt/d/CALC-experiments/runs/gaia2-adaptability3-flash-v2/tasks.lock.json",
+  "filesystem_root": "/mnt/d/CALC-experiments/data/gaia2/filesystem/demo_filesystem",
+  "output_dir": "/mnt/d/CALC-experiments/runs/gaia2-adaptability3-flash-v2",
+  "base_url": "https://api.deepseek.com/v1",
+  "model": "deepseek-flash",
+  "manta_max_tool_iterations": 8,
+  "preflight_public_records": true,
+  "runtime": {"concurrency": 3, "max_output_tokens": 4096, "max_waves": null,
+              "collaboration_mode": "full", "progress_checkpoints": true}
+}

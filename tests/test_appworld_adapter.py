@@ -105,3 +105,17 @@ def test_only_development_splits(official_contract):
 def test_reference_loading_cannot_be_enabled_in_config(official_contract):
     with pytest.raises(ValueError, match="isolation"):
         AppWorldAdapter("train_task", "test", {"load_ground_truth": True})
+
+
+def test_shared_session_keeps_official_save_then_evaluate_order(official_contract):
+    adapter = AppWorldAdapter('train_task', 'test-session', {})
+    session = adapter.session()
+    port = session.actor_environment()
+    assert port.events is None
+    port.invoke('appworld_api', {'app': 'notes', 'api': 'set', 'arguments_json': '{"text":"hello"}'})
+    assert adapter.world.saved is False
+    session.finish()
+    assert session.evaluate('done')['fixture_only'] is True
+    assert adapter.phase == 'evaluated'
+    session.close()
+    assert adapter.world.closed

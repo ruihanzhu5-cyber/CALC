@@ -6,9 +6,11 @@ No actor receives reference actions and no external API is called.
 """
 import json
 from pathlib import Path
+import sys
 
-from run_adaptive_workbench import load_benchmark, CONTEXT
-from calc.adaptive import AdaptiveRuntime
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+from calc.benchmarks.workbench import load_benchmark, WorkBenchAdapter
+from calc.benchmarks.session import adaptive_runtime
 from calc.llm import ChatResponse, Usage
 
 
@@ -41,15 +43,12 @@ class Scripted:
         p = {"report_id": f'p{current["event_version"]}',
              "summary": "Scripted plumbing progress only",
              "next_step": "Execute the next scripted action", "evidence_ids": current["evidence_ids"],
-             "decision": "continue",
              "reason": "Exercise explicit assessment without an extra model call"}
         for call in result.message.get("tool_calls", []):
             if call["function"]["name"] == "collaborate":
                 args = json.loads(call["function"]["arguments"])
                 args["event_version"] += 1  # report commits before this full-envelope proposal
                 args["progress"].update(progress=p["summary"], next_step=p["next_step"])
-                if args["operation"] in {"delegate", "fold", "merge"}:
-                    p["decision"] = "change"
                 call["function"]["arguments"] = json.dumps(args)
         if not result.message.get("tool_calls"):
             p["answer"] = result.message["content"]
@@ -79,15 +78,8 @@ def main():
     data = Path("D:/CALC-experiments/data/workbench")
     benchmark, sandbox_type, format_call, _ = load_benchmark(repo, data)
     task = benchmark.load_tasks()[0]
-    sandbox = sandbox_type(data)
-    available = benchmark._build_tools(sandbox, task.metadata["domains"])
-    mapping = {t["name"].replace(".", "__"): t for t in available}
-    actions = []
-
-    def invoke(name, arguments):
-        spec = mapping[name]
-        actions.append(format_call(spec["name"], arguments))
-        return spec["handler"](arguments)
+    adapter = WorkBenchAdapter(benchmark, sandbox_type, format_call, data, task)
+    session = adapter.session()
 
     strong = Scripted([
         change(operation="delegate", pattern="parallel", reason="exercise isolation",
@@ -99,21 +91,23 @@ def main():
     weak = Scripted([tool("company_directory__find_email_address", {"name": "Alex"}),
                      change(operation="continue", reason="report blocked work to parent"),
                      tool("company_directory__find_email_address", {"name": "Alex"})])
-    runtime = AdaptiveRuntime(strong=strong, weak=weak, invoke=invoke, max_waves=8, progress_checkpoints=True,
-        environment_context=CONTEXT, tools=[{"type": "function", "function": {
-            "name": name, "description": t["description"], "parameters": t["parameters"]}}
-            for name, t in mapping.items()])
-    result = runtime.run(str(task.prompt))
-    evaluation = benchmark.evaluate(task, result["answer"], run_metadata={"function_calls": actions})
+    runtime = adaptive_runtime(session.actor_environment(), strong=strong, weak=weak,
+                               options={'max_waves': 8, 'progress_checkpoints': True})
+    try:
+        result = runtime.run(adapter.instruction)
+        session.finish()
+        evaluation = session.evaluate(result['answer'])
+    finally:
+        session.close()
     assert result["status"] == "answered"
     assert result["loops"]["agent_1"]["status"] == "folded"
     assert [e["agent"] for e in result["events"] if e["event"] == "tool_result"] == ["agent_1", "agent_1", "main"]
     assert evaluation.success is False
     print(json.dumps({"check": "passed", "external_api_calls": 0, "scripted_decisions": len(result["calls"]),
-                      "real_sandbox_tool_calls": len(actions), "fold_then_parent_tool": True,
+                      "real_sandbox_tool_calls": len(adapter.actions), "fold_then_parent_tool": True,
                       "task_completion": True, "benchmark_success": evaluation.success,
                       "progress_checkpoints": result["metrics"]["progress_checkpoints"],
-                      "progress_assessments": result["metrics"]["progress_assessments"],
+                      "task_state_updates": result["metrics"]["task_state_updates"],
                       "note": "offline plumbing validation; not a model benchmark result"}, indent=2))
 
 

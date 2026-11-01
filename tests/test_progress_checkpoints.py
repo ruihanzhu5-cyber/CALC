@@ -34,7 +34,6 @@ class Scripted:
 def report_args(actor, **kwargs):
     return {'report_id': f'p{len(actor.progress_reports)}', 'summary': 'Known facts inspected',
             'next_step': 'Current owner checks the remaining source', 'evidence_ids': list(actor.evidence),
-            'decision': 'continue',
             'reason': 'A direct tool handles the remaining lookup', **kwargs}
 
 
@@ -46,7 +45,6 @@ def assessed(*calls, decision='continue', answer=None, **extra):
         actor = next(a for a in state if a['id'] == who)
         p = {'report_id': f'p{actor["event_version"]}', 'summary': 'Updated from current observations',
              'next_step': 'Current owner checks the remaining source', 'evidence_ids': actor['evidence_ids'],
-             'decision': decision,
              'reason': 'Independent work benefits from delegation' if decision == 'change' else 'Direct continuation is sufficient', **extra}
         if answer:
             p['answer'] = answer
@@ -69,7 +67,7 @@ def runtime(strong=(), weak=(), **kw):
 def test_trivial_task_assesses_and_answers_in_one_normal_request():
     r = runtime([assessed(answer='answer')]).run('small request')
     assert r['answer'] == 'answer' and r['usage']['model_requests'] == 1
-    assert r['metrics']['continue_decisions'] == 1 and len(r['loops']) == 1
+    assert r['metrics']['task_state_updates'] == 1 and len(r['loops']) == 1
     assert r['loops']['main']['work']['progress'].startswith('Local answer submitted')
 
 
@@ -80,7 +78,7 @@ def test_new_collection_gets_main_checkpoint_without_children_or_extra_judge():
     assert r['status'] == 'answered' and r['usage']['model_requests'] == 3
     assert r['metrics']['progress_checkpoints'] == 2  # initial + first collection, not every lookup
     assert 'collection_observed' in rt.clients['strong'].received[1][0]['content']
-    assert r['metrics']['continue_decisions'] == 2 and len(r['loops']) == 1
+    assert r['metrics']['task_state_updates'] == 2 and len(r['loops']) == 1
     assert r['metrics']['decision_opportunities'] == 0  # no parent wakeups
 
 
@@ -96,13 +94,13 @@ def test_progress_and_delegation_in_same_call_can_expand_after_inline_work():
     assert r['metrics']['progress_protocol_errors'] == 0
 
 
-def test_missing_assessment_never_executes_business_tool():
+def test_optional_report_never_gates_business_tool():
     executed = []
     rt = runtime([batch(('read', {})), assessed(('read', {})), batch(answer='done')],
                  invoke=lambda n, a: executed.append(n) or {'value': 1})
     r = rt.run('task')
-    assert executed == ['read'] and r['usage']['model_requests'] == 3
-    assert r['metrics']['progress_protocol_errors'] == 1  # visible normal-model protocol repair, no hidden call
+    assert executed == ['read', 'read'] and r['usage']['model_requests'] == 3
+    assert r['metrics']['progress_protocol_errors'] == 0
 
 
 def test_business_tool_listed_first_cannot_create_evidence_for_its_report():
@@ -110,19 +108,20 @@ def test_business_tool_listed_first_cannot_create_evidence_for_its_report():
     main = rt._new('task', None, 'strong', [])
     p = report_args(main, evidence_ids=['e0'])
     rt._accept(main, batch(('read', {}), ('report_progress', p)), None, [])
-    assert rt.archive == {} and main.progress_reports == {}
+    assert len(rt.archive) == 1 and main.progress_reports == {}
     rt._accept(main, batch(('read', {}), ('report_progress', report_args(main))), None, [])
-    assert len(rt.archive) == 1 and main.latest_report == 'p0'
-    assert main.progress_reports['p0']['evidence_ids'] == []
+    assert len(rt.archive) == 2 and main.latest_report == 'p0'
+    assert main.progress_reports['p0']['evidence_ids'] == ['e0']
 
 
-def test_multiple_ledger_writes_reject_entire_batch_before_side_effects():
+def test_multiple_ledger_writes_reject_reports_but_not_business_tool():
     executed = []
     rt = runtime(invoke=lambda n, a: executed.append(n))
     main = rt._new('task', None, 'strong', [])
     p = report_args(main)
     rt._accept(main, batch(('report_progress', p), ('read', {}), ('report_progress', {**p, 'report_id': 'other'})), None, [])
-    assert executed == [] and main.latest_report is None
+    assert executed == ['read'] and main.latest_report is None
+    assert sum(e['event'] == 'progress_report_error' for e in rt.events) == 1
 
 
 def test_progress_reporting_is_independent_and_ordinary_updates_do_not_wake_parent():
@@ -158,16 +157,16 @@ def test_repeated_report_is_idempotent_and_cannot_assess_later_events():
     rt._report_progress(main, p)
     assert rt._report_progress(main, p)['duplicate'] is True
     rt._tool(main, 'read', {})
+    assert rt._report_progress(main, p)['duplicate'] is True
+    assert len(main.checkpoints) == 1  # retransmission alone consumes no new event
     rt._accept(main, batch(('report_progress', p), ('read', {})), None, [])
-    assert len(rt.archive) == 1 and len(main.checkpoints) == 1
-    with pytest.raises(ValueError, match='earlier assessment'):
-        rt._report_progress(main, p)
+    assert len(rt.archive) == 2 and main.checkpoints == {}
 
 
 def test_stale_progress_reference_rejects_topology_change():
     rt = runtime()
     main = rt._new('task', None, 'strong', [])
-    rt._report_progress(main, report_args(main, decision='change'))
+    rt._report_progress(main, report_args(main))
     rt._tool(main, 'read', {})
     with pytest.raises(ValueError, match='stale'):
         rt.change(main.id, {'operation': 'delegate', 'progress_ref': 'p0', 'reason': 'split'})
@@ -214,7 +213,7 @@ def test_invalid_plan_is_atomic():
     assert main == before
 
 
-def test_concurrent_notice_cannot_make_old_report_look_current():
+def test_concurrent_notice_is_delivered_at_next_request_boundary():
     executed = []
     rt = runtime(invoke=lambda n, a: executed.append(n))
     main = rt._new('task', None, 'strong', [])
@@ -224,10 +223,14 @@ def test_concurrent_notice_cannot_make_old_report_look_current():
     seen_checkpoints = list(main.checkpoints)
     rt._notice(main.id, 'dependency_changed', child, {'dependency': 'new'})
     rt._accept(main, batch(('report_progress', old), ('read', {})), None, [], seen_checkpoints, request_version)
-    assert main.latest_report is None and executed == []
-    assert len(main.checkpoints) == 2
+    assert main.latest_report == 'p0' and executed == ['read']
+    assert main.checkpoints == {} and len(main.inbox) == 1
+    rt._deliver_notices(main)
+    assert len(main.checkpoints) == 1 and main.inbox == []
+    rt._notice(main.id, 'dependency_changed', child, {'dependency': 'new'})
+    assert main.inbox == []  # identical notice cannot wake the parent twice
     rt._accept(main, batch(('report_progress', report_args(main)), ('read', {})), None, [])
-    assert executed == ['read'] and main.checkpoints == {}
+    assert executed == ['read', 'read'] and main.checkpoints == {}
 
 
 def test_nested_record_metadata_is_not_a_new_work_collection():

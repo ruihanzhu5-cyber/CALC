@@ -267,3 +267,28 @@ def test_same_blocked_report_does_not_wake_parent_again():
     m.status = 'waiting'
     assert rt.change(a.id, proposal(rt, a.id, event_type='blocked'))['duplicate']
     assert m.status == 'waiting' and len(m.notices) == 1
+
+
+def test_late_response_after_migration_cannot_execute_source_or_receiver_tools():
+    executed = []
+    rt, m, a, b = setup_three(tools=[function('read', 'read', {}, [])],
+                              invoke=lambda n, args: executed.append(args))
+    source_epoch, receiver_epoch = a.owner_epoch, b.owner_epoch
+    rt.change(m.id, proposal(rt, operation='merge', sources=[a.id], receiver=b.id))
+    for actor, epoch in [(a, source_epoch), (b, receiver_epoch)]:
+        rt._accept(actor, response(tool='read', args={'stale': actor.id}), None, [], request_epoch=epoch)
+    assert executed == []
+    assert sum(e['event'] == 'stale_response_discarded' for e in rt.events) == 2
+    rt._accept(b, response(tool='read', args={'current': b.id}), None, [], request_epoch=b.owner_epoch)
+    assert executed == [{'current': b.id}]
+
+
+def test_new_completion_notice_requires_parent_to_observe_it_before_final():
+    rt, m, a, b = setup_three()
+    a.status = b.status = 'done'
+    rt._notice(m.id, 'completed', a, {'result': 'new evidence'})
+    rt._finish_actor(m, 'answer based on old input')
+    assert m.status == 'ready' and rt.final == ''
+    rt._deliver_notices(m)
+    rt._finish_actor(m, 'answer using new evidence')
+    assert rt.final == 'answer using new evidence'

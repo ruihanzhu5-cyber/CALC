@@ -13,9 +13,16 @@ import threading
 from pathlib import Path
 
 from calc.adaptive import function
+from calc.benchmarks.session import EvaluationSession
 
 UPSTREAM_COMMIT = "42b5bcf3cd334fee33f0c37c02070a9f5807add5"
 DATA_VERSION = "0.2.0"
+PUBLIC_CONTEXT = ("All APIs operate in one shared local task environment. "
+    "Use official API documentation; do not invent APIs. Only Main calls "
+    "supervisor.complete_task after resolving all delegated work. "
+    "Read API schemas and pagination parameters; do not claim all records were checked "
+    "after reading only a default first page. When the user asks for a specific value, "
+    "put that value alone in complete_task's answer; explanations belong in the final message.")
 API_TOOL = function("appworld_api", "Call an official API in the shared task environment. "
     "Discover APIs with api_docs.show_app_descriptions, show_api_descriptions(app_name), "
     "show_api_doc(app_name, api_name). Only Main should use supervisor.complete_task, when finished. "
@@ -113,3 +120,7 @@ class AppWorldAdapter:
     def close(self) -> None:
         self.world.close()
         self.phase = "closed"
+
+    def session(self) -> EvaluationSession:
+        return EvaluationSession(tools=self.tools, invoke=self.invoke, context=PUBLIC_CONTEXT,
+            finish=self.finish, evaluate=lambda answer: self.evaluate(), close=self.close)

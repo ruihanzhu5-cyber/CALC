@@ -16,7 +16,7 @@ from time import perf_counter
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from calc.adaptive import AdaptiveRuntime  # noqa: E402
+from calc.benchmarks.session import adaptive_runtime  # noqa: E402
 from calc.benchmarks.appworld import AppWorldAdapter, development_ids, verify_source, DATA_VERSION  # noqa: E402
 from calc.llm import OpenAICompatibleClient, aggregate_usage  # noqa: E402
 from calc.progress import MODES, allowed_operations  # noqa: E402
@@ -83,7 +83,8 @@ def main() -> int:
         "calc_commit": subprocess.check_output([*git, "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "source_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in [ROOT / "src/calc/adaptive.py", ROOT / "src/calc/progress.py",
-                      ROOT / "src/calc/benchmarks/appworld.py", ROOT / "src/calc/llm.py", Path(__file__)]},
+                      ROOT / "src/calc/benchmarks/appworld.py", ROOT / "src/calc/benchmarks/session.py",
+                      ROOT / "src/calc/llm.py", Path(__file__)]},
         "config": cfg, "runtime": options,
         "allowed_initial_operations": sorted(allowed_operations(mode, True, True)),
         "allowed_later_operations": sorted(allowed_operations(mode, False, True)),
@@ -103,33 +104,28 @@ def main() -> int:
             official_output = Path(cfg["appworld_root"]) / "experiments/outputs" / experiment / "tasks" / tid
             if official_output.exists():
                 raise FileExistsError(f"refusing to overwrite official task output: {official_output}")
-            adapter, runtime = None, None
+            adapter, runtime, session = None, None, None
             try:
                 adapter = AppWorldAdapter(tid, experiment, cfg["environment"])
+                session = adapter.session()
                 if args.execute:
                     with (task_dir / "trace.jsonl").open("w", encoding="utf-8") as trace:
                         def emit(event):
                             trace.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
                             trace.flush()
-                        runtime = AdaptiveRuntime(strong=clients["strong"], weak=clients["weak"],
-                            tools=adapter.tools, invoke=adapter.invoke, event_sink=emit,
-                            environment_context="All APIs operate in one shared local task environment. "
-                            "Use official API documentation; do not invent APIs. Only Main calls "
-                            "supervisor.complete_task after resolving all delegated work. "
-                            "Read API schemas and pagination parameters; do not claim all records were checked "
-                            "after reading only a default first page. When the user asks for a specific value, "
-                            "put that value alone in complete_task's answer; explanations belong in the final message.", **options)
+                        runtime = adaptive_runtime(session.actor_environment(), strong=clients['strong'],
+                            weak=clients['weak'], event_sink=emit, options=options)
                         result = runtime.run(adapter.instruction)
                 else:
-                    observation = adapter.invoke("appworld_api", {"app": "api_docs",
+                    observation = session.invoke("appworld_api", {"app": "api_docs",
                         "api": "show_app_descriptions", "arguments_json": "{}"})
                     if not observation.strip() or "Traceback" in observation:
                         raise RuntimeError("official documentation API preflight failed")
                     result = {"status": "preflight_only", "usage": {"model_requests": 0},
                               "note": "Documentation lookup only; not a model result or attempted solution"}
                 write_json(task_dir / "result.json", result)
-                adapter.finish()
-                evaluation = adapter.evaluate()
+                session.finish()
+                evaluation = session.evaluate(result.get('answer', ''))
                 write_json(task_dir / "evaluation.json", evaluation)
             except Exception as exc:
                 write_json(task_dir / "failure.json", {"error_type": type(exc).__name__, "detail": str(exc),
@@ -137,7 +133,9 @@ def main() -> int:
                     "usage": aggregate_usage(runtime.calls) if runtime is not None else None})
                 raise  # persist the failure; no substitute answer/score, no paid retry
             finally:
-                if adapter is not None:
+                if session is not None:
+                    session.close()
+                elif adapter is not None:
                     adapter.close()
             rows.append({"task_id": tid, "runtime_completed": result["status"] == "answered",
                          "success": evaluation["success"], "usage": result["usage"],

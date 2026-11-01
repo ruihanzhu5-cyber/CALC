@@ -26,13 +26,13 @@ def function(name: str, description: str, properties: dict, required: list[str])
 
 
 REPORT_PROGRESS = function("report_progress", "Update local progress independently of delegation. "
-    "At pending checkpoints explicitly assess continue vs change; runtime binds the request state automatically. "
-    "May accompany business tools OR collaborate. "
+    "Optional task-state update, never required before business tools. "
+    "May accompany business tools OR collaborate; this does not change the team. "
     "Can deliver answer alone when work is finished; no separate judge call.", {
     "report_id": {"type": "string"},
     "summary": {"type": "string"}, "next_step": {"type": "string"},
     "evidence_ids": {"type": "array", "items": {"type": "string"}},
-    "decision": {"type": "string", "enum": ["continue", "change"]}, "reason": {"type": "string"},
+    "reason": {"type": "string"},
     "signal": {"type": "string", "enum": ["progress", "blocked", "conflict", "overlap"]},
     "subgoals": {"type": "array", "items": {"type": "object", "properties": {
         "id": {"type": "string"}, "goal": {"type": "string"},
@@ -40,7 +40,7 @@ REPORT_PROGRESS = function("report_progress", "Update local progress independent
         "dependencies": {"type": "array", "items": {"type": "string"}}},
         "required": ["id", "goal", "status", "dependencies"], "additionalProperties": False}},
     "answer": {"type": "string"}},
-    ["report_id", "summary", "next_step", "evidence_ids", "decision", "reason"])
+    ["report_id", "summary", "next_step", "evidence_ids", "reason"])
 
 COLLABORATE = function("collaborate", "Request a fixed collaboration change. May accompany report_progress, "
     "but not business tools. With progress_ref reuse that report's work, evidence, version, baseline and handoff.", {
@@ -107,20 +107,20 @@ wait needs only operation and reason. Never call wait while requests need your r
 Main and workers may recursively delegate. Keep working inline if no valuable split exists.
 Do not answer while transferred responsibilities remain unresolved: explicitly complete them.
 
-Progress checkpoints are decision opportunities, NOT commands to create agents.
-Before acting at pending checkpoints, include one report_progress.
-The runtime binds it to the state and checkpoint IDs shown in this request; do not calculate version numbers.
-Assess independent work, dependencies, conflicts and cheaper direct/tool-based solutions.
-Use decision=continue with a concrete reason if staying inline is best. Use change when proposing a change.
+Progress checkpoints are facts to consider during normal execution, NOT mandatory reporting gates.
+Continue with business tools or answer directly when no organization change is useful.
+report_progress updates task facts only; it NEVER changes the team. There is no change/continue report label.
+When new independent work, blocking dependencies, conflicts or coupled branches justify a change,
+use collaborate with an explicit operation and the next work its receiver will actually execute.
 You may report progress plus business tools in ONE response: the report describes evidence already received,
-not the outputs of tools you are about to call. Report progress at plan changes even if you keep one loop.
+not the outputs of tools you are about to call. Report meaningful plan changes when useful, not every step.
 Use signal=blocked/conflict/overlap for substantive issues needing your parent's attention.
 subgoals are your working plan, not benchmark truth. Stable IDs and dependencies make plan changes observable.
 You can report progress plus collaborate in ONE response, with no business tools in that response.
 For a concise proposal use progress_ref=<report_id>, operation, reason, proposed_next, expected_savings, risks
 and operation arguments. Work, evidence, baseline_next and handoff are taken from that versioned report.
 Do not request a change solely because a collection has many items: an aggregate API may solve it directly.
-If completing at a checkpoint, report_progress with answer can assess and answer in ONE response.
+An optional report_progress with answer can update the ledger and finish in ONE response.
 Never combine an answer with other tools. Do not invent reports, evidence, benefits, or completed work.
 """
 
@@ -151,6 +151,8 @@ class Loop:
     progress_reports: dict[str, dict] = field(default_factory=dict)
     latest_report: str | None = None
     subgoals: list[dict] = field(default_factory=list)
+    owner_epoch: int = 0
+    inbox: list[dict] = field(default_factory=list)
 
 
 class AdaptiveRuntime:
@@ -287,8 +289,8 @@ class AdaptiveRuntime:
         for key in ("report_id", "summary", "next_step", "reason"):
             if not isinstance(p.get(key), str) or not p[key].strip():
                 raise ValueError(f"nonempty {key} required")
-        if p.get("decision") not in {"continue", "change"}:
-            raise ValueError("decision must be continue or change")
+        if "decision" in p:
+            raise ValueError("progress is task state, not an organization decision; use collaborate")
         if p.get("signal", "progress") not in {"progress", "blocked", "conflict", "overlap"}:
             raise ValueError("invalid progress signal")
         for key in ("evidence_ids",):
@@ -296,19 +298,17 @@ class AdaptiveRuntime:
                 raise ValueError(f"{key} must be a list of IDs")
         if any(e not in actor.evidence for e in p["evidence_ids"]):
             raise ValueError("progress evidence must belong to this loop")
-        if "answer" in p and (not isinstance(p["answer"], str) or not p["answer"].strip() or p["decision"] != "continue"):
-            raise ValueError("a final progress report must continue and contain a nonempty answer")
+        if "answer" in p and (not isinstance(p["answer"], str) or not p["answer"].strip()):
+            raise ValueError("a final progress report must contain a nonempty answer")
         expected = actor.version if request_version is None else request_version
         acknowledged = list(actor.checkpoints) if checkpoint_ids is None else list(checkpoint_ids)
         if expected != actor.version:
             raise ValueError("execution state changed since this model request; reassess the new state")
-        # Identical retransmission is idempotent only without new checkpoints to assess.
+        # Retransmission does not consume newly arrived checkpoints.
         old = actor.progress_reports.get(p["report_id"])
         if old is not None:
             if old["input"] != p:
                 raise ValueError("report_id already used with different content")
-            if acknowledged:
-                raise ValueError("report_id describes an earlier assessment; use a new report for new checkpoints")
             return {"progress_ref": p["report_id"], "duplicate": True}
         if any(c not in actor.checkpoints for c in acknowledged):
             raise ValueError("request checkpoint already consumed")
@@ -328,14 +328,13 @@ class AdaptiveRuntime:
         actor.latest_report = p["report_id"]
         self.emit("progress_report", agent=actor.id, progress_ref=p["report_id"], summary=p["summary"],
                   next_step=p["next_step"], evidence_ids=p["evidence_ids"], subgoals=goals)
-        self.emit("collaboration_assessment", agent=actor.id, progress_ref=p["report_id"],
-                  checkpoint_ids=acknowledged, decision=p["decision"], reason=p["reason"],
-                  evidence_ids=p["evidence_ids"])
+        self.emit("task_state_updated", agent=actor.id, progress_ref=p["report_id"],
+                  checkpoint_ids=acknowledged, reason=p["reason"], evidence_ids=p["evidence_ids"])
         if p.get("signal", "progress") != "progress":
             self._notice(actor.parent, p["signal"], actor,
                          {"work": asdict(actor.work), "evidence_ids": p["evidence_ids"]})
         return {"progress_ref": p["report_id"], "event_version": actor.version,
-                "decision": p["decision"], "topology_changed": False}
+                "topology_changed": False}
 
     def _expand_proposal(self, actor: Loop, p: dict) -> dict:
         if "progress_ref" not in p:
@@ -345,8 +344,6 @@ class AdaptiveRuntime:
         report = actor.progress_reports[p["progress_ref"]]
         if p["progress_ref"] != actor.latest_report or report["version"] != actor.version:
             raise ValueError("progress_ref is stale; update local progress before proposing")
-        if p.get("operation") in {"delegate", "merge", "fold", "escalate"} and report["input"]["decision"] != "change":
-            raise ValueError("a topology proposal requires a progress assessment choosing change")
         return {**p, "event_type": "progress", "event_version": actor.version,
                 "progress": copy.deepcopy(report["work"]), "evidence_ids": report["evidence_ids"],
                 "baseline_next": report["work"]["next_step"],
@@ -362,15 +359,31 @@ class AdaptiveRuntime:
         if key in self.seen_notices or receiver.status not in {"ready", "waiting", "review"}:
             return
         self.seen_notices.add(key)
-        receiver.version += 1
         notice = {"type": kind, "source": source.id, "source_version": source.version,
-                  "event_version": receiver.version, "details": details}
+                  "id": key, "details": details}
         receiver.notices.append(notice)
-        self._checkpoint(receiver, kind, key, notice)
-        receiver.messages.append({"role": "user", "content": "Progress event: " + json.dumps(notice)})
+        receiver.inbox.append(notice)
         if receiver.status != "review":
             receiver.status = "ready"
         self.emit("decision_opportunity", agent=target, notice=notice)
+
+    def _deliver_notices(self, actor: Loop) -> None:
+        """Deliver once at the next request boundary, never mutate an in-flight input."""
+        if not actor.inbox:
+            return
+        notices, actor.inbox = actor.inbox, []
+        actor.version += 1
+        actor.messages.append({"role": "user", "content": "New task events: " + json.dumps(notices)})
+        for notice in notices:
+            if notice["type"] != "environment_observation":
+                self._checkpoint(actor, notice["type"], notice["id"], notice)
+        self.emit("events_delivered", agent=actor.id, event_ids=[n["id"] for n in notices])
+
+    def _consume_checkpoints(self, actor: Loop, ids: list[str]) -> None:
+        consumed = [cid for cid in ids if actor.checkpoints.pop(cid, None) is not None]
+        if consumed:
+            self.emit("checkpoint_consumed", agent=actor.id, checkpoint_ids=consumed,
+                      meaning="Observed by a normal decision; no organization change implied")
 
     def change(self, actor_id: str, p: dict) -> dict:
         actor = self.loops[actor_id]
@@ -543,12 +556,14 @@ class AdaptiveRuntime:
         receiver.dependencies = new_dependencies
         receiver.status = "ready"
         receiver.version += 1
+        receiver.owner_epoch += 1
         self._checkpoint(receiver, "work_transferred", fingerprint([(a.id, a.version) for a in sources]),
                          {"sources": source_ids, "history_refs": source_ids})
         for a in sources:
             a.status = "folded" if operation == "fold" else "merged"
             a.transferred_to = receiver.id
             a.version += 1
+            a.owner_epoch += 1
         for other in self.loops.values():
             if other.transferred_to in replacing and not other.resolved:
                 other.transferred_to = receiver.id
@@ -636,8 +651,13 @@ class AdaptiveRuntime:
                 actor.status = "ready"
 
     def _accept(self, actor: Loop, response: Any, error: str | None, pending: list,
-                required_checkpoints: list[str] | None = None, request_version: int | None = None) -> None:
+                required_checkpoints: list[str] | None = None, request_version: int | None = None,
+                request_epoch: int | None = None) -> None:
         self._record_call(actor.id, actor.tier, response, error)
+        if (request_epoch is not None and request_epoch != actor.owner_epoch) or actor.status in {"folded", "merged"}:
+            self.emit("stale_response_discarded", agent=actor.id, request_epoch=request_epoch,
+                      current_epoch=actor.owner_epoch)
+            return
         if error:
             actor.status = "failed"
             actor.version += 1
@@ -657,22 +677,30 @@ class AdaptiveRuntime:
                     raise ValueError("object arguments required")
                 reports = [args for _, name, args in parsed if name == "report_progress"]
                 names = [name for _, name, _ in parsed]
-                if len(reports) > 1:
-                    raise ValueError("one local progress write per model response")
                 if "collaborate" in names and (names.count("collaborate") > 1 or set(names) - {"collaborate", "report_progress"}):
                     raise ValueError("collaborate may only accompany report_progress")
-                if required and not reports:
-                    raise ValueError("assess pending checkpoints with report_progress in this response before acting")
                 if reports and "answer" in reports[0] and len(calls) != 1:
                     raise ValueError("a progress answer cannot accompany other tools")
-                # The report describes existing observations, even if it is listed after a business tool.
-                report_result = self._report_progress(actor, reports[0], request_version, required) if reports else None
             except (ValueError, KeyError, TypeError) as exc:
                 for call in calls:
                     actor.messages.append({"role": "tool", "tool_call_id": call["id"],
                         "content": json.dumps({"error": type(exc).__name__, "detail": str(exc)})})
                 self.emit("progress_protocol_error", agent=actor.id, error=str(exc))
                 return
+            # Validate only the ledger write before tools. A bad optional report is
+            # returned as its own error; it must not cancel unrelated business work.
+            report_result = None
+            report_error = False
+            if reports:
+                try:
+                    if len(reports) != 1:
+                        raise ValueError("one local progress write per model response")
+                    report_result = self._report_progress(actor, reports[0], request_version, required)
+                except (ValueError, KeyError, TypeError) as exc:
+                    report_error = True
+                    report_result = {"error": type(exc).__name__, "detail": str(exc)}
+                    self.emit("progress_report_error", agent=actor.id, error=str(exc))
+            self._consume_checkpoints(actor, required)
             if actor.parent is None and any(name in self.tool_names for name in names):
                 self.initial_open = False
             for call, name, args in parsed:
@@ -680,6 +708,8 @@ class AdaptiveRuntime:
                     if name == "report_progress":
                         result = report_result
                     elif name == "collaborate":
+                        if report_error:
+                            raise ValueError("repair the report before using it in a collaboration proposal")
                         # Complete the tool protocol before archiving/migrating history.
                         result = {"proposal_queued": True}
                         pending.append((actor, args))
@@ -696,7 +726,7 @@ class AdaptiveRuntime:
                               error=type(exc).__name__)
                 actor.messages.append({"role": "tool", "tool_call_id": call["id"],
                                        "content": json.dumps(result, ensure_ascii=False, default=str)})
-            if reports and "answer" in reports[0]:
+            if reports and not report_error and "answer" in reports[0]:
                 self._finish_actor(actor, reports[0]["answer"])
             return
         text = message.get("content") or ""
@@ -707,16 +737,13 @@ class AdaptiveRuntime:
             self._notice(actor.parent, "failed", actor,
                          {"reason": "no_complete_answer", "work": asdict(actor.work)})
             return
-        if required:
-            actor.messages.append({"role": "user", "content":
-                "Assess pending checkpoints before answering. report_progress may include the final answer."})
-            self.emit("progress_protocol_error", agent=actor.id, error="answer without checkpoint assessment")
-            return
+        self._consume_checkpoints(actor, required)
         self._finish_actor(actor, text)
 
     def _finish_actor(self, actor: Loop, text: str) -> None:
-        if actor.checkpoints:
-            actor.messages.append({"role": "user", "content": "New progress events remain to assess before answering."})
+        if actor.inbox:
+            actor.status = "ready"
+            actor.messages.append({"role": "user", "content": "New task events arrived during this request; read them before finishing."})
             return
         if self._live_children(actor.id):
             deciding = any(r["parent"] == actor.id and r["status"] == "pending" for r in self.requests.values())
@@ -738,8 +765,6 @@ class AdaptiveRuntime:
         self.emit("local_answer", agent=actor.id, answer=text)
         if actor.parent:
             parent = self.loops[actor.parent]
-            parent.messages.append({"role": "user", "content": json.dumps({"child": actor.id,
-                "result": text, "evidence_ids": actor.evidence}, ensure_ascii=False)})
             parent.evidence = list(dict.fromkeys(parent.evidence + actor.evidence))
             self._notice(parent.id, "completed", actor, {"result": text, "evidence_ids": actor.evidence})
         else:
@@ -755,10 +780,10 @@ class AdaptiveRuntime:
             for actor in self.loops.values():
                 if actor.status not in {"ready", "waiting", "review"}:
                     continue
-                actor.messages.append({"role": "user", "content": "Environment update: " + json.dumps(event)})
-                actor.version += 1
-                self._checkpoint(actor, "environment_update", identity, event)
-                if actor.status == "waiting":
+                actor.inbox.append({"id": identity, "type": "environment_observation", "details": event})
+                # Public observations are delivered locally. Only an explicit new
+                # user message wakes a waiting coordinator; workers still progress.
+                if actor.parent is None and actor.status == "waiting" and event.get("type") == "USER_MESSAGE":
                     actor.status = "ready"
 
     def run(self, instruction: str, *, resume: bool = False) -> dict:
@@ -790,7 +815,9 @@ class AdaptiveRuntime:
                 break
             wave += 1
             # The executor limit constrains simultaneous calls, not team size.
-            required = {a.id: (list(a.checkpoints), a.version) for a in ready}
+            for actor in ready:
+                self._deliver_notices(actor)
+            required = {a.id: (list(a.checkpoints), a.version, a.owner_epoch) for a in ready}
             with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
                 responses = list(pool.map(self._request, ready))
             pending = []
@@ -814,8 +841,9 @@ class AdaptiveRuntime:
                             "switches": sum(e["event"] in {"delegate", "merge", "fold", "escalate"} for e in self.events),
                             "progress_calls": sum(r["contains_progress"] for r in self.calls),
                             "progress_checkpoints": sum(e["event"] == "progress_checkpoint" for e in self.events),
-                            "progress_assessments": sum(e["event"] == "collaboration_assessment" for e in self.events),
-                            "continue_decisions": sum(e["event"] == "collaboration_assessment" and e["decision"] == "continue" for e in self.events),
+                            "task_state_updates": sum(e["event"] == "task_state_updated" for e in self.events),
                             "progress_protocol_errors": sum(e["event"] == "progress_protocol_error" for e in self.events),
+                            "progress_report_errors": sum(e["event"] == "progress_report_error" for e in self.events),
+                            "delivered_event_batches": sum(e["event"] == "events_delivered" for e in self.events),
                             "decision_opportunities": sum(e["event"] == "decision_opportunity" for e in self.events)},
                 "requests": self.requests}

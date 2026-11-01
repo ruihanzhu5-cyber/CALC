@@ -6,15 +6,42 @@ Oracle trajectories and judge state remain private to the environment.
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, is_dataclass
+from enum import Enum
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from calc.llm import OpenAICompatibleClient
+from calc.benchmarks.session import EvaluationSession
 
 ARE_COMMIT = "a9fd2edccb4bc7e22fbf45c8482a5fef30a2a5a4"
 MANTA_COMMIT = "3da40879d690a25459cc401292e5c6f0cc366d84"
+
+
+def public_value(value):
+    """Lossless JSON representation of official public tool return types.
+
+    Text stays text; dataclass records stay records. Unknown types fail explicitly
+    instead of silently turning data into a truncated Python repr downstream.
+    """
+    if isinstance(value, Enum):
+        return public_value(value.value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return public_value(asdict(value))
+    if isinstance(value, dict):
+        if any(not isinstance(k, str) for k in value):
+            raise TypeError("public tool dictionaries require string keys")
+        return {k: public_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [public_value(v) for v in value]
+    if value is None or type(value) in (str, int, float, bool):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    raise TypeError(f"unsupported public tool result: {type(value).__name__}")
 PUBLIC_CONTEXT = """You operate a shared application environment with evolving user requests.
 Use the public API tools and notifications. Environment updates can supersede earlier requests.
 All workers share the same application state. Avoid duplicate writes.
@@ -156,12 +183,12 @@ class Gaia2Adapter:
             if name not in self.app_tools:
                 raise ValueError("tool not in public catalog")
             try:
-                result = self.app_tools[name](**args)
+                result = public_value(self.app_tools[name](**args))
                 if name == "AgentUserInterface__send_message_to_user":
                     self.sent += 1
                 self.emit({"event": "tool_result", "name": name, "arguments": args,
-                           "result": str(result), "success": True})
-                return str(result)
+                           "result": result, "success": True})
+                return result
             except Exception as exc:
                 self.emit({"event": "tool_result", "name": name, "arguments": args,
                            "error": str(exc), "success": False})
@@ -173,6 +200,10 @@ class Gaia2Adapter:
     def close(self):
         self.env.stop()
 
+    def session(self) -> EvaluationSession:
+        return EvaluationSession(tools=self.tools, invoke=self.invoke, context=PUBLIC_CONTEXT,
+            events=self.pending, evaluate=lambda answer: self.evaluate(), close=self.close)
+
 
 class ClockedClient:
     def __init__(self, client: OpenAICompatibleClient, adapter: Gaia2Adapter, emit):
@@ -180,14 +211,19 @@ class ClockedClient:
         self.model = client.model
 
     def complete(self, messages, **kwargs):
+        request_id, started = uuid.uuid4().hex, time.perf_counter()
+        self.emit({"event": "actor_input", "request_id": request_id, "messages": messages,
+                   "tools": kwargs.get("tools", []), "model": self.model})
         self.adapter.begin_request()
         try:
             response = self.client.complete(messages, **kwargs)
-            self.emit({"event": "actor_request", "usage": response.usage.to_dict(),
+            self.emit({"event": "actor_request", "request_id": request_id,
+                       "elapsed_seconds": time.perf_counter() - started, "usage": response.usage.to_dict(),
                        "finish_reason": response.finish_reason, "message": response.message})
             return response
         except Exception as exc:
-            self.emit({"event": "actor_request", "usage": {}, "error": type(exc).__name__})
+            self.emit({"event": "actor_request", "request_id": request_id,
+                       "elapsed_seconds": time.perf_counter() - started, "usage": {}, "error": type(exc).__name__})
             raise
         finally:
             self.adapter.end_request()
