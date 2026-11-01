@@ -32,9 +32,9 @@ class Scripted:
 
 
 def report_args(actor, **kwargs):
-    return {'report_id': f'p{len(actor.progress_reports)}', 'observed_version': actor.version, 'summary': 'Known facts inspected',
+    return {'report_id': f'p{len(actor.progress_reports)}', 'summary': 'Known facts inspected',
             'next_step': 'Current owner checks the remaining source', 'evidence_ids': list(actor.evidence),
-            'checkpoint_ids': list(actor.checkpoints), 'decision': 'continue',
+            'decision': 'continue',
             'reason': 'A direct tool handles the remaining lookup', **kwargs}
 
 
@@ -44,10 +44,9 @@ def assessed(*calls, decision='continue', answer=None, **extra):
         who = system.split('You are ')[1].split('.')[0]
         state = json.loads(system.split('Current team state: ')[1].split('\n')[0])
         actor = next(a for a in state if a['id'] == who)
-        checkpoints = json.loads(system.split('Pending progress checkpoints: ')[1].split('\n')[0])
-        p = {'report_id': f'p{actor["event_version"]}', 'observed_version': actor['event_version'], 'summary': 'Updated from current observations',
+        p = {'report_id': f'p{actor["event_version"]}', 'summary': 'Updated from current observations',
              'next_step': 'Current owner checks the remaining source', 'evidence_ids': actor['evidence_ids'],
-             'checkpoint_ids': [c['id'] for c in checkpoints], 'decision': decision,
+             'decision': decision,
              'reason': 'Independent work benefits from delegation' if decision == 'change' else 'Direct continuation is sufficient', **extra}
         if answer:
             p['answer'] = answer
@@ -157,10 +156,12 @@ def test_repeated_report_is_idempotent_and_cannot_assess_later_events():
     main = rt._new('task', None, 'strong', [])
     p = report_args(main)
     rt._report_progress(main, p)
+    assert rt._report_progress(main, p)['duplicate'] is True
     rt._tool(main, 'read', {})
     rt._accept(main, batch(('report_progress', p), ('read', {})), None, [])
     assert len(rt.archive) == 1 and len(main.checkpoints) == 1
-    assert rt._report_progress(main, p)['duplicate'] is True
+    with pytest.raises(ValueError, match='earlier assessment'):
+        rt._report_progress(main, p)
 
 
 def test_stale_progress_reference_rejects_topology_change():
@@ -219,10 +220,27 @@ def test_concurrent_notice_cannot_make_old_report_look_current():
     main = rt._new('task', None, 'strong', [])
     child = rt._new('child', main.id, 'weak', [])
     old = report_args(main)
+    request_version = main.version
     seen_checkpoints = list(main.checkpoints)
     rt._notice(main.id, 'dependency_changed', child, {'dependency': 'new'})
-    rt._accept(main, batch(('report_progress', old), ('read', {})), None, [], seen_checkpoints)
+    rt._accept(main, batch(('report_progress', old), ('read', {})), None, [], seen_checkpoints, request_version)
     assert main.latest_report is None and executed == []
     assert len(main.checkpoints) == 2
     rt._accept(main, batch(('report_progress', report_args(main)), ('read', {})), None, [])
     assert executed == ['read'] and main.checkpoints == {}
+
+
+def test_nested_record_metadata_is_not_a_new_work_collection():
+    result = {'song_id': 78, 'artists': [{'id': 1}, {'id': 2}], 'tags': [{'id': 3}, {'id': 4}]}
+    assert collection_facts(result) == []
+    assert collection_facts({'results': [result, {**result, 'song_id': 36}]})[0]['count'] == 2
+
+
+def test_correctable_tool_argument_error_does_not_force_reorganization_assessment():
+    def invoke(name, args):
+        raise ValueError('missing argument')
+    rt = runtime(invoke=invoke)
+    main = rt._new('task', None, 'strong', [])
+    rt._accept(main, batch(('report_progress', report_args(main)), ('read', {})), None, [])
+    assert len(main.work.failed_routes) == 1 and main.checkpoints == {}
+    assert [e['event'] for e in rt.events].count('tool_error') == 1

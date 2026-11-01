@@ -115,7 +115,10 @@ def main() -> int:
                             tools=adapter.tools, invoke=adapter.invoke, event_sink=emit,
                             environment_context="All APIs operate in one shared local task environment. "
                             "Use official API documentation; do not invent APIs. Only Main calls "
-                            "supervisor.complete_task after resolving all delegated work.", **options)
+                            "supervisor.complete_task after resolving all delegated work. "
+                            "Read API schemas and pagination parameters; do not claim all records were checked "
+                            "after reading only a default first page. When the user asks for a specific value, "
+                            "put that value alone in complete_task's answer; explanations belong in the final message.", **options)
                         result = runtime.run(adapter.instruction)
                 else:
                     observation = adapter.invoke("appworld_api", {"app": "api_docs",

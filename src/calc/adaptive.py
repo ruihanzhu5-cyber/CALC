@@ -26,12 +26,12 @@ def function(name: str, description: str, properties: dict, required: list[str])
 
 
 REPORT_PROGRESS = function("report_progress", "Update local progress independently of delegation. "
-    "At pending checkpoints explicitly assess continue vs change. May accompany business tools OR collaborate. "
+    "At pending checkpoints explicitly assess continue vs change; runtime binds the request state automatically. "
+    "May accompany business tools OR collaborate. "
     "Can deliver answer alone when work is finished; no separate judge call.", {
-    "report_id": {"type": "string"}, "observed_version": {"type": "integer", "minimum": 0},
+    "report_id": {"type": "string"},
     "summary": {"type": "string"}, "next_step": {"type": "string"},
     "evidence_ids": {"type": "array", "items": {"type": "string"}},
-    "checkpoint_ids": {"type": "array", "items": {"type": "string"}},
     "decision": {"type": "string", "enum": ["continue", "change"]}, "reason": {"type": "string"},
     "signal": {"type": "string", "enum": ["progress", "blocked", "conflict", "overlap"]},
     "subgoals": {"type": "array", "items": {"type": "object", "properties": {
@@ -40,7 +40,7 @@ REPORT_PROGRESS = function("report_progress", "Update local progress independent
         "dependencies": {"type": "array", "items": {"type": "string"}}},
         "required": ["id", "goal", "status", "dependencies"], "additionalProperties": False}},
     "answer": {"type": "string"}},
-    ["report_id", "observed_version", "summary", "next_step", "evidence_ids", "checkpoint_ids", "decision", "reason"])
+    ["report_id", "summary", "next_step", "evidence_ids", "decision", "reason"])
 
 COLLABORATE = function("collaborate", "Request a fixed collaboration change. May accompany report_progress, "
     "but not business tools. With progress_ref reuse that report's work, evidence, version, baseline and handoff.", {
@@ -108,8 +108,8 @@ Main and workers may recursively delegate. Keep working inline if no valuable sp
 Do not answer while transferred responsibilities remain unresolved: explicitly complete them.
 
 Progress checkpoints are decision opportunities, NOT commands to create agents.
-Before acting at pending checkpoints, include one report_progress acknowledging their IDs.
-Set observed_version to your current event_version; reports must not claim to have seen later changes.
+Before acting at pending checkpoints, include one report_progress.
+The runtime binds it to the state and checkpoint IDs shown in this request; do not calculate version numbers.
 Assess independent work, dependencies, conflicts and cheaper direct/tool-based solutions.
 Use decision=continue with a concrete reason if staying inline is best. Use change when proposing a change.
 You may report progress plus business tools in ONE response: the report describes evidence already received,
@@ -278,7 +278,8 @@ class AdaptiveRuntime:
         self.emit("progress_checkpoint", agent=actor.id, checkpoint=actor.checkpoints[cid])
         return cid
 
-    def _report_progress(self, actor: Loop, p: dict) -> dict:
+    def _report_progress(self, actor: Loop, p: dict, request_version: int | None = None,
+                         checkpoint_ids: list[str] | None = None) -> dict:
         """One local ledger write; never schedules a model or changes ownership."""
         for key in ("report_id", "summary", "next_step", "reason"):
             if not isinstance(p.get(key), str) or not p[key].strip():
@@ -287,30 +288,33 @@ class AdaptiveRuntime:
             raise ValueError("decision must be continue or change")
         if p.get("signal", "progress") not in {"progress", "blocked", "conflict", "overlap"}:
             raise ValueError("invalid progress signal")
-        for key in ("evidence_ids", "checkpoint_ids"):
+        for key in ("evidence_ids",):
             if not isinstance(p.get(key), list) or any(not isinstance(x, str) for x in p[key]):
                 raise ValueError(f"{key} must be a list of IDs")
         if any(e not in actor.evidence for e in p["evidence_ids"]):
             raise ValueError("progress evidence must belong to this loop")
         if "answer" in p and (not isinstance(p["answer"], str) or not p["answer"].strip() or p["decision"] != "continue"):
             raise ValueError("a final progress report must continue and contain a nonempty answer")
-        # Identical retransmission is idempotent, and cannot acknowledge later events.
+        expected = actor.version if request_version is None else request_version
+        acknowledged = list(actor.checkpoints) if checkpoint_ids is None else list(checkpoint_ids)
+        if expected != actor.version:
+            raise ValueError("execution state changed since this model request; reassess the new state")
+        # Identical retransmission is idempotent only without new checkpoints to assess.
         old = actor.progress_reports.get(p["report_id"])
         if old is not None:
             if old["input"] != p:
                 raise ValueError("report_id already used with different content")
+            if acknowledged:
+                raise ValueError("report_id describes an earlier assessment; use a new report for new checkpoints")
             return {"progress_ref": p["report_id"], "duplicate": True}
-        if type(p.get("observed_version")) is not int or p["observed_version"] != actor.version:
-            raise ValueError("stale observed_version; report must refer to the current execution state")
-        if len(set(p["checkpoint_ids"])) != len(p["checkpoint_ids"]) or any(c not in actor.checkpoints for c in p["checkpoint_ids"]):
-            raise ValueError("unknown, duplicate or already assessed checkpoint")
+        if any(c not in actor.checkpoints for c in acknowledged):
+            raise ValueError("request checkpoint already consumed")
         goals = validate_subgoals(p["subgoals"]) if "subgoals" in p else actor.subgoals
         plan_changed = goals != actor.subgoals
         actor.subgoals = copy.deepcopy(goals)
         actor.work.progress, actor.work.next_step = p["summary"], p["next_step"]
         actor.work.unresolved = [g["goal"] for g in goals if g["status"] != "done"]
         actor.version += 1
-        acknowledged = list(p["checkpoint_ids"])
         if plan_changed:
             cid = self._checkpoint(actor, "plan_changed", fingerprint(goals), {"subgoals": goals})
             if cid:
@@ -629,7 +633,7 @@ class AdaptiveRuntime:
                 actor.status = "ready"
 
     def _accept(self, actor: Loop, response: Any, error: str | None, pending: list,
-                required_checkpoints: list[str] | None = None) -> None:
+                required_checkpoints: list[str] | None = None, request_version: int | None = None) -> None:
         self._record_call(actor.id, actor.tier, response, error)
         if error:
             actor.status = "failed"
@@ -654,12 +658,12 @@ class AdaptiveRuntime:
                     raise ValueError("one local progress write per model response")
                 if "collaborate" in names and (names.count("collaborate") > 1 or set(names) - {"collaborate", "report_progress"}):
                     raise ValueError("collaborate may only accompany report_progress")
-                if required and (not reports or set(required) - set(reports[0].get("checkpoint_ids", []))):
+                if required and not reports:
                     raise ValueError("assess pending checkpoints with report_progress in this response before acting")
                 if reports and "answer" in reports[0] and len(calls) != 1:
                     raise ValueError("a progress answer cannot accompany other tools")
                 # The report describes existing observations, even if it is listed after a business tool.
-                report_result = self._report_progress(actor, reports[0]) if reports else None
+                report_result = self._report_progress(actor, reports[0], request_version, required) if reports else None
             except (ValueError, KeyError, TypeError) as exc:
                 for call in calls:
                     actor.messages.append({"role": "tool", "tool_call_id": call["id"],
@@ -685,8 +689,6 @@ class AdaptiveRuntime:
                     if route not in actor.work.failed_routes:
                         actor.work.failed_routes.append(route)
                         actor.version += 1
-                    self._checkpoint(actor, "tool_failure", route,
-                                     {"tool": name, "error": type(exc).__name__, "detail": str(exc)})
                     self.emit("tool_error", agent=actor.id, tool=call.get("function", {}).get("name"),
                               error=type(exc).__name__)
                 actor.messages.append({"role": "tool", "tool_call_id": call["id"],
@@ -759,12 +761,12 @@ class AdaptiveRuntime:
                 break
             wave += 1
             # The executor limit constrains simultaneous calls, not team size.
-            required = {a.id: list(a.checkpoints) for a in ready}
+            required = {a.id: (list(a.checkpoints), a.version) for a in ready}
             with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
                 responses = list(pool.map(self._request, ready))
             pending = []
             for actor, (response, error) in zip(ready, responses):
-                self._accept(actor, response, error, pending, required[actor.id])
+                self._accept(actor, response, error, pending, *required[actor.id])
             for actor, proposal in pending:
                 try:
                     outcome = self.change(actor.id, proposal)

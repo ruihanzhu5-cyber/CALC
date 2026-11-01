@@ -38,10 +38,10 @@ class Scripted:
         actor = system.split("You are ")[1].split(".")[0]
         state = json.loads(system.split("Current team state: ")[1].split("\n")[0])
         current = next(a for a in state if a["id"] == actor)
-        p = {"report_id": f'p{current["event_version"]}', "observed_version": current['event_version'],
+        p = {"report_id": f'p{current["event_version"]}',
              "summary": "Scripted plumbing progress only",
              "next_step": "Execute the next scripted action", "evidence_ids": current["evidence_ids"],
-             "checkpoint_ids": [c["id"] for c in checkpoints], "decision": "continue",
+             "decision": "continue",
              "reason": "Exercise explicit assessment without an extra model call"}
         for call in result.message.get("tool_calls", []):
             if call["function"]["name"] == "collaborate":
