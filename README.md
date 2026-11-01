@@ -4,6 +4,8 @@ Contribution-Aware Agent Lifecycle and Context Management：面向高效多智�
 
 CALC 将“谁继续执行、把职责交给谁、接收者获得什么信息”作为一个协作决策。当前 V0 包含可安装核心、可运行生命周期闭环、BrowseComp-Plus 模型/检索入口，以及可选 POrchestra/GAIA2 适配。研究使用现成 benchmark 的任务与官方评分。
 
+2026-11-01 的 V1 方法调研与设计已保存：[最新机制调研](docs/literature/CALC_V1_TRIGGER_REVIEW_20261101.md) · [V1 方法方案](refine-logs/calc-v1-20261101/FINAL_PROPOSAL.md)。V1 聚焦学习具体协作干预相对原样继续的质量/成本增益，支持 Main/Worker 分派与任务驱动的团队结构；第一轮比较收敛为 CLM + BrowseComp-Plus + DeepSeek Flash。该交付目前是方法设计，尚未替换下述 V0 运行代码或产生 V1 分数。
+
 ## 方法闭环
 
 ![CALC V0 当前系统架构](figures/calc-v0-architecture.png)
