@@ -1,0 +1,5 @@
+{
+  "base_url": "SET_QWEN_API_BASE_URL",
+  "model": "Qwen/Qwen3-32B",
+  "api_key_env": "BCP_JUDGE_API_KEY"
+}

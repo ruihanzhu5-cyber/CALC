@@ -1,0 +1,22 @@
+{
+  "theme": "base",
+  "look": "classic",
+  "fontFamily": "Microsoft YaHei, Arial, sans-serif",
+  "themeVariables": {
+    "fontSize": "19px",
+    "primaryTextColor": "#213047",
+    "lineColor": "#6b7280",
+    "background": "#ffffff",
+    "titleColor": "#17283e",
+    "edgeLabelBackground": "#ffffff"
+  },
+  "flowchart": {
+    "htmlLabels": true,
+    "curve": "basis",
+    "nodeSpacing": 45,
+    "wrappingWidth": 340,
+    "rankSpacing": 65,
+    "padding": 18,
+    "diagramPadding": 24
+  }
+}

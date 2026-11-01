@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "resolved_on": "2026-10-31",
+  "repositories": [
+    {
+      "name": "POrchestra",
+      "url": "https://github.com/XueyangFeng/POrchestra.git",
+      "commit": "371aef619aec6f2918690a2fbaf9bf797b3025d3",
+      "role": "orchestration baseline and optional GAIA2 runtime",
+      "license_note": "Retain upstream licenses/ and THIRD_PARTY.md; inference release only."
+    },
+    {
+      "name": "CLM",
+      "url": "https://github.com/facebookresearch/context-language-models.git",
+      "commit": "483198229ab7b90c0eed4651306ab3b3505aaf50",
+      "role": "context-management reference; not a reproduced CALC baseline yet",
+      "license_note": "Inspect pinned upstream license before redistribution."
+    },
+    {
+      "name": "BrowseComp-Plus",
+      "url": "https://github.com/texttron/BrowseComp-Plus.git",
+      "commit": "046949032b0328319cc9a02663a759ec601d9402",
+      "role": "official benchmark, retriever interfaces and evaluator",
+      "license_note": "MIT repository; keep dataset and corpus provenance separate."
+    }
+  ],
+  "optional_runtime": {
+    "ARE": {
+      "url": "https://github.com/facebookresearch/meta-agents-research-environments.git",
+      "commit": "7946367413129784139e785ae4c351090002a0bb",
+      "patch": ".upstreams/POrchestra/integrations/are-compat.patch",
+      "note": "POrchestra's documented runtime. Not cloned or patched by the baseline bootstrap. Review execution/validation patch before formal experiments."
+    }
+  }
+}
