@@ -24,6 +24,7 @@ class ActorEnvironment:
     context: str
     events: Callable[[], list[dict]] | None
     is_final_submission: Callable[[str, dict], bool] | None = None
+    tool_traits: Callable[[str, dict], dict] | None = None
 
 
 class EvaluationSession:
@@ -37,13 +38,15 @@ class EvaluationSession:
                  evaluate: Callable[[str], Any], close: Callable[[], None] | None,
                  finish: Callable[[], None] | None = None,
                  events: Callable[[], list[dict]] | None = None,
-                 is_final_submission: Callable[[str, dict], bool] | None = None):
+                 is_final_submission: Callable[[str, dict], bool] | None = None,
+                 tool_traits: Callable[[str, dict], dict] | None = None):
         names = [t['function']['name'] for t in tools]
         if len(names) != len(set(names)):
             raise ValueError('duplicate public tool names')
         self._tools, self._names = deepcopy(tools), frozenset(names)
         self._invoke, self._events = invoke, events
         self._is_final_submission = is_final_submission
+        self._tool_traits = tool_traits
         self._evaluate, self._finish, self._close = evaluate, finish, close
         self._context, self._lock = context, RLock()
         self.phase = 'execute'
@@ -51,7 +54,7 @@ class EvaluationSession:
     def actor_environment(self) -> ActorEnvironment:
         return ActorEnvironment(deepcopy(self._tools), self.invoke, self._context,
                                 self.poll if self._events is not None else None,
-                                self._is_final_submission)
+                                self._is_final_submission, self._tool_traits)
 
     def invoke(self, name: str, arguments: dict) -> Any:
         with self._lock:
@@ -105,4 +108,5 @@ def adaptive_runtime(environment: ActorEnvironment, *, strong, weak, options: di
     return AdaptiveRuntime(strong=strong, weak=weak, tools=environment.tools,
         invoke=environment.invoke, external_events=environment.events,
         environment_context=environment.context, event_sink=event_sink,
-        skills=skills, is_final_submission=environment.is_final_submission, **options)
+        skills=skills, is_final_submission=environment.is_final_submission,
+        tool_traits=environment.tool_traits, **options)

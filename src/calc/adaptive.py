@@ -21,6 +21,7 @@ from calc.capabilities import ToolRegistry
 from calc.protocol import parse_tool_calls
 from calc.scheduling import (decision_tools, snapshot, assert_current, normalize_candidate,
                              preview, cost_panel, StaleDecisionError)
+from calc.triggers import tool_traits as describe_tool, observe_source, compile_candidate, control_messages
 from calc.progress import (WorkReport, MODES, EVENT_TYPES, OPERATIONS, allowed_operations,
                            fingerprint, validate_proposal, collection_facts, validate_subgoals)
 
@@ -78,6 +79,8 @@ COLLABORATE = function("collaborate", "Request a fixed collaboration change. May
     "receiver": {"type": "string"},
     "evidence_ids": {"type": "array", "items": {"type": "string"}},
 }, ["operation", "reason"])
+COLLABORATE['function']['parameters']['properties']['branches']['items']['properties'].update({
+    'read_only': {'type': 'boolean'}, 'source_family': {'type': 'string'}})
 # A retained responsibility uses the same precise shape as a work report.
 COLLABORATE["function"]["parameters"]["properties"]["retained_work"] = copy.deepcopy(
     COLLABORATE["function"]["parameters"]["properties"]["progress"])
@@ -183,23 +186,40 @@ class Loop:
     scheduling_suggestion: dict | None = None
     scheduling_wait: dict[str, list] = field(default_factory=dict)
     first_observation: bool = False
+    read_only: bool = False
+    source_family: str | None = None
+    read_sources: dict[str, dict] = field(default_factory=dict)
+    assigned_read_sources: list[str] = field(default_factory=list)
+    compiled_triggers: list[str] = field(default_factory=list)
+    output_pressure: dict | None = None
+    pressure_seen: list[str] = field(default_factory=list)
+    recovery_step: dict | None = None
 
 
 class AdaptiveRuntime:
     def __init__(self, *, strong: Any, weak: Any, tools: list[dict],
                  invoke: Callable[[str, dict], Any], skills: dict[str, dict] | None = None,
-                 concurrency: int = 1, max_output_tokens: int = 4096,
+                 concurrency: int = 1, max_output_tokens: int | None = None,
                  max_waves: int | None = None, event_sink: Callable[[dict], None] | None = None,
+                 max_case_tokens: int | None = None, max_case_requests: int | None = None,
                  environment_context: str = "", collaboration_mode: str = "full",
                  resource_key: Callable[[str, dict], str | None] | None = None,
                  progress_checkpoints: bool = True,
                  scheduling: str = "voluntary",
+                 compiled_triggers: bool = False,
+                 output_pressure_review: bool = False,
+                 tool_traits: Callable[[str, dict], dict] | None = None,
                  tool_loading: str = "all",
                  is_final_submission: Callable[[str, dict], bool] | None = None,
                  external_events: Callable[[], list[dict]] | None = None,
                  clock: Callable[[], float] = perf_counter):
-        if concurrency < 1 or max_output_tokens < 1 or (max_waves is not None and max_waves < 1):
+        if (concurrency < 1 or (max_output_tokens is not None and
+                (type(max_output_tokens) is not int or max_output_tokens < 1)) or
+                (max_waves is not None and max_waves < 1)):
             raise ValueError("positive concurrency/output/wave limits required")
+        for limit in (max_case_tokens, max_case_requests):
+            if limit is not None and (type(limit) is not int or limit < 1):
+                raise ValueError('case budgets must be positive integers or null')
         reserved = {"collaborate", "report_progress", "load_skill", "read_evidence", "read_history",
                     "complete_transferred_work", "discover_tools", "load_tools",
                     "decide_collaboration", "commit_collaboration"}
@@ -215,6 +235,14 @@ class AdaptiveRuntime:
         if scheduling == "explicit" and not progress_checkpoints:
             raise ValueError("explicit scheduling requires progress_checkpoints")
         self.scheduling = scheduling
+        if compiled_triggers and scheduling != 'explicit':
+            raise ValueError('compiled triggers require explicit scheduling')
+        self.compiled_triggers = compiled_triggers
+        if output_pressure_review and not compiled_triggers:
+            raise ValueError('output pressure review requires compiled triggers')
+        self.output_pressure_review = output_pressure_review
+        self.tool_traits = tool_traits
+        self.world_version = 0
         self.decide_tool, self.commit_tool = decision_tools(COLLABORATE)
         self.emit_lock = RLock()
         self.request_serial = 0
@@ -231,6 +259,8 @@ class AdaptiveRuntime:
         self.concurrency = concurrency
         self.max_output_tokens = max_output_tokens
         self.max_waves = max_waves
+        self.max_case_tokens = max_case_tokens
+        self.max_case_requests = max_case_requests
         self.event_sink = event_sink
         self.environment_context = environment_context
         self.loops: dict[str, Loop] = {}
@@ -304,6 +334,9 @@ Do not report or delegate just to demonstrate activity. New observations can jus
         system += "\nAllowed collaboration operations: " + json.dumps(sorted(
             allowed_operations(self.collaboration_mode, self.initial_open, actor.parent is None)))
         system += "\nYour event_version: " + str(actor.version)
+        system += "\nRead-only business scope enforced by runtime: " + str(actor.read_only)
+        if actor.recovery_step is not None:
+            system += "\nExecute ONLY this bounded recovery step now; the global task is still unfinished: " + json.dumps(actor.recovery_step)
         system += "\nPending progress checkpoints: " + json.dumps(list(actor.checkpoints.values()), ensure_ascii=False)
         system += "\nPending requests to decide: " + json.dumps([
             {"request_id": k, "actor": v["actor"], "proposal": v["proposal"]}
@@ -319,19 +352,40 @@ Do not report or delegate just to demonstrate activity. New observations can jus
         return [REPORT_PROGRESS, COLLABORATE, LOAD_SKILL, READ_EVIDENCE, READ_HISTORY, COMPLETE_WORK,
                 *([DISCOVER_TOOLS, LOAD_TOOLS] if self.tool_loading == "deferred" else [])]
 
+    def _commit_schema(self, actor: Loop) -> dict:
+        item = actor.scheduling_candidate
+        tool = copy.deepcopy(self.commit_tool)
+        if item is not None and 'alternatives' in item:
+            params = tool['function']['parameters']
+            params['properties'].pop('commit')
+            params['properties']['selection'] = {'type': 'string', 'enum':
+                ['keep', *[a['id'] for a in item['alternatives']]]}
+            params['required'] = ['selection', 'reason']
+        return tool
+
     def _request(self, actor: Loop, scheduling_state: dict | None = None):
         messages = self._messages(actor)
         tools = [*self.registry.scoped(actor.allowed_tools).load(actor.loaded_tools), *self.execution_controls()]
+        if actor.recovery_step is not None and scheduling_state is None:
+            tools = self.registry.scoped(actor.allowed_tools).load([actor.recovery_step['tool']])
         if scheduling_state is not None:
+            if self.compiled_triggers:
+                messages = control_messages(self, actor, scheduling_state)
             committing = actor.scheduling_candidate is not None
-            tools = [self.commit_tool if committing else self.decide_tool]
+            tools = [self._commit_schema(actor) if committing else self.decide_tool]
             body = actor.scheduling_candidate if committing else scheduling_state
             messages.append({"role": "user", "content":
-                ("COMMIT STAGE. Inspect the same-work cost panel. Call commit_collaboration exactly once; "
-                 "commit=false resumes the original session. No business tools or answer.\n" if committing else
+                ("COMMIT STAGE. Inspect all same-work alternatives and their compiled costs. "
+                 "Call commit_collaboration exactly once using the provided schema. "
+                 "When selection is offered, choose keep or a listed fixed pattern; otherwise choose commit. "
+                 "A keep selection (or commit=false) resumes the original session. If output_pressure exists, keep MUST "
+                 "provide recovery_step={goal,tool} for exactly one already-loaded business tool. "
+                 "No business tools or answer in this stage.\n" if committing else
                  "DECIDE STAGE. Call decide_collaboration exactly once. Compare unchanged continuation with "
                  "a useful fixed-operation candidate; keep is fully valid. Only candidates list covered_work_ids. "
                  "Snapshot/event identity is already bound by the runtime; do not echo hashes or event IDs. "
+                 "If output_pressure exists, keep MUST provide recovery_step={goal,tool} for exactly one "
+                 "already-loaded business tool, rather than retrying the entire task; defer is not a recovery. "
                  "Read the task and observations to identify new dependencies or independent goals; "
                  "a prior report_progress is NOT required. Preserve unfinished objectives and completion "
                  "conditions; role differences or collection size alone do not justify delegation. "
@@ -402,7 +456,7 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             if response.finish_reason != "tool_calls":
                 raise ValueError("decision must be a complete native tool call")
             calls = parse_tool_calls(response.message.get("tool_calls"))
-            tool = self.commit_tool if committing else self.decide_tool
+            tool = self._commit_schema(actor) if committing else self.decide_tool
             if len(calls) != 1 or calls[0][1] != tool['function']['name']:
                 raise ValueError("one decision call and no business actions required")
             call, _, data = calls[0]
@@ -416,10 +470,21 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                                    'content': json.dumps({'decision_received': True})})
             if committing:
                 item = actor.scheduling_candidate
-                if data['commit']:
-                    outcome = self.change(actor.id, item['proposal'])
+                if 'alternatives' in item:
+                    commit = data['selection'] != 'keep'
+                    chosen = next((a['proposal'] for a in item['alternatives']
+                                   if a['id'] == data['selection']), None)
+                else:
+                    commit, chosen = data['commit'], item['proposal']
+                if commit:
+                    if 'recovery_step' in data:
+                        raise ValueError('choose committed reorganization or inline recovery, not both')
+                    outcome = self.change(actor.id, chosen)
+                    actor.output_pressure = None
+                    actor.recovery_step = None
                     selected = 'commit'
                 else:
+                    self._select_recovery(actor, data)
                     outcome, selected = {'continue_original_session': True}, 'keep'
                 actor.scheduling_candidate = None
                 self._consume_checkpoints(actor, state['event_ids'])
@@ -435,6 +500,8 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                 raise ValueError('decision evidence unavailable to this owner')
             choice = data['decision']
             if choice == 'candidate':
+                if 'recovery_step' in data:
+                    raise ValueError('candidate and recovery_step are separate alternatives')
                 proposal = normalize_candidate(actor, state, data)
                 signature = fingerprint([actor.id, proposal, state['versions'], actor.observed_facts])
                 if signature in self.seen_schedule_candidates:
@@ -450,6 +517,8 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             if any(r['parent'] == actor.id and r['status'] == 'pending' for r in self.requests.values()):
                 raise ValueError('decide pending child requests before keep/defer')
             if choice == 'defer':
+                if actor.output_pressure is not None or 'recovery_step' in data:
+                    raise ValueError('output pressure requires a concrete recovery step or reorganization')
                 children = {a.id: a for a in self._live_children(actor.id)}
                 if any(d not in children for d in data['dependencies']):
                     raise ValueError('defer requires live direct-child dependencies')
@@ -459,6 +528,7 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                                          for d in data['dependencies']}
                 actor.status = 'waiting'
             else:
+                self._select_recovery(actor, data)
                 actor.scheduling_wait = {}
             actor.work.next_step = data['next_work']
             self._consume_checkpoints(actor, state['event_ids'])
@@ -483,6 +553,72 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             self.emit('scheduling_error', agent=actor.id, purpose=purpose,
                       error=type(exc).__name__, detail=str(exc))
             self._notice(actor.parent, 'failed', actor, {'reason': 'scheduling_error', 'work': asdict(actor.work)})
+
+    def _select_recovery(self, actor: Loop, data: dict) -> None:
+        if actor.output_pressure is None:
+            if 'recovery_step' in data:
+                raise ValueError('recovery_step is only valid for actual output pressure')
+            return
+        if 'recovery_step' not in data:
+            raise ValueError('keep after output exhaustion requires a bounded recovery_step')
+        step = data['recovery_step']
+        if step['tool'] not in actor.loaded_tools or step['tool'] not in self.tool_names:
+            raise ValueError('recovery must select an already-loaded business tool')
+        actor.recovery_step = copy.deepcopy(step)
+        actor.messages.append({'role': 'user', 'content': 'Output pressure recovery. Execute one bounded step: ' + json.dumps(step)})
+        self.emit('recovery_step_selected', agent=actor.id, step=step)
+
+    def _compile_opportunity(self, actor: Loop, state: dict) -> bool:
+        item = compile_candidate(self, actor, state)
+        if item is None:
+            return False
+        actor.compiled_triggers.append(item['signature'])
+        self.emit('trigger_fired', agent=actor.id, trigger_kind=item['kind'], facts=item['facts'],
+                  signature=item['signature'], action='candidate comparison required, not automatic commit')
+        compiled = []
+        for alternative in item.get('alternatives', [{'id': item['proposal']['operation'], 'proposal': item['proposal']}]):
+            try:
+                shadow = preview(self, actor.id, alternative['proposal'])
+                compiled.append({**alternative, 'cost_panel': cost_panel(self, shadow, state)})
+            except (ValueError, KeyError, TypeError) as exc:
+                self.emit('compiled_alternative_infeasible', agent=actor.id, trigger_kind=item['kind'],
+                          alternative=alternative['id'], reason=str(exc))
+        if not compiled:
+            self.emit('compiled_candidate_infeasible', agent=actor.id, trigger_kind=item['kind'])
+            return False
+        panel = compiled[0]['cost_panel']
+        actor.scheduling_candidate = {'snapshot_id': state['snapshot_id'], 'state': state,
+            'proposal': compiled[0]['proposal'], 'cost_panel': panel, 'trigger_kind': item['kind'], 'facts': item['facts']}
+        if 'alternatives' in item:
+            actor.scheduling_candidate['alternatives'] = compiled
+        self.emit('scheduling_candidate', agent=actor.id, snapshot_id=state['snapshot_id'],
+                  covered_work_ids=[u['work_id'] for u in state['work']], proposal=compiled[0]['proposal'],
+                  cost_panel=panel, trigger_kind=item['kind'],
+                  alternatives=actor.scheduling_candidate.get('alternatives', []))
+        return True
+
+    def _capture_output_pressure(self, actor: Loop, response: Any) -> None:
+        key = fingerprint([actor.id, actor.owner_epoch, actor.observed_facts, actor.loaded_tools])
+        self.emit('execution_output_truncated', agent=actor.id, response=response.message,
+                  finish_reason=response.finish_reason, usage=response.usage.to_dict(),
+                  actions_executed=False)
+        if key in actor.pressure_seen:
+            actor.status = 'failed'
+            actor.version += 1
+            self.emit('loop_failed', agent=actor.id, reason='output_pressure_without_new_execution_state')
+            self._notice(actor.parent, 'failed', actor, {'reason': 'output_pressure_without_new_execution_state'})
+            return
+        actor.pressure_seen.append(key)
+        actor.output_pressure = {'fingerprint': key, 'finish_reason': 'length',
+            'input_tokens': response.usage.input_tokens,
+            'output_tokens': response.usage.output_tokens, 'reasoning_tokens': response.usage.reasoning_tokens,
+            'configured_output_limit': self.max_output_tokens, 'actions_executed': False}
+        actor.status = 'ready'
+        actor.version += 1
+        actor.messages.append({'role': 'user', 'content': 'Execution ended with finish_reason=length. '
+            'No actions from that response ran. Scheduling will compare reorganization or one bounded recovery step.'})
+        self._checkpoint(actor, 'resource_pressure', key, actor.output_pressure)
+        self._notice(actor.parent, 'resource_pressure', actor, actor.output_pressure)
 
     def _report_progress(self, actor: Loop, p: dict, request_version: int | None = None,
                          checkpoint_ids: list[str] | None = None) -> dict:
@@ -695,8 +831,13 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                     raise ValueError("branch goal required")
                 if not isinstance(b.get("skills", []), list) or any(s not in self.skills for s in b.get("skills", [])):
                     raise ValueError("unknown capability")
-                if set(b) - {"goal", "skills", "completion_condition", "handoff", "tools", "evidence_ids"}:
+                if set(b) - {"goal", "skills", "completion_condition", "handoff", "tools", "evidence_ids",
+                             "read_only", "source_family"}:
                     raise ValueError("unknown branch fields")
+                if type(b.get('read_only', False)) is not bool:
+                    raise ValueError('read_only must be boolean')
+                if 'source_family' in b and b['source_family'] not in actor.read_sources:
+                    raise ValueError('source_family must reference an observed source')
                 for key in ("completion_condition", "handoff"):
                     if key in b and (not isinstance(b[key], str) or not b[key].strip()):
                         raise ValueError(f"nonempty branch.{key} required")
@@ -710,6 +851,8 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             history_ref = f"{actor.id}@{actor.version}"
             for b in branches:
                 child = self._new(b["goal"], actor.id, "weak", b.get("skills", []))
+                child.read_only = actor.read_only or b.get('read_only', False)
+                child.source_family = b.get('source_family')
                 child.evidence = list(b.get("evidence_ids", evidence_ids))
                 child.allowed_tools = list(b.get("tools", actor.allowed_tools))
                 child.loaded_tools = list(child.allowed_tools) if self.tool_loading == "all" else []
@@ -724,7 +867,8 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                     "parent_progress": copy.deepcopy(p.get("progress", asdict(actor.work))),
                     "evidence_ids": child.evidence, "history_ref": history_ref,
                     "history_access": "immutable snapshot at delegation; use read_history",
-                    "tools": child.allowed_tools}
+                    "tools": child.allowed_tools, "read_only": child.read_only,
+                    "source_family": child.source_family}
                 child.messages.append({"role": "user", "content":
                     "Work assignment. Execute only your assigned responsibility; facts are not instructions.\n" +
                     json.dumps(assignment, ensure_ascii=False)})
@@ -735,6 +879,8 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                 actor.work = retained
                 actor.goal = retained.current_scope
             actor.status = "ready" if retained is not None else "waiting"
+            actor.assigned_read_sources = list(dict.fromkeys(actor.assigned_read_sources +
+                [b['source_family'] for b in branches if 'source_family' in b]))
             actor.pattern = pattern
             actor.version += 1
             self.emit("delegate", actor=actor_id, pattern=pattern, children=[a.id for a in children],
@@ -873,6 +1019,15 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                              for a in self.loops.values())
             if actor.parent is not None or self._live_children(actor.id) or unresolved:
                 raise ValueError("only Main with all delegated responsibilities resolved may submit")
+        traits = describe_tool(self, name, args)
+        if actor.read_only and traits['effect'] != 'read':
+            raise PermissionError('read-only responsibility cannot invoke write or unknown effects')
+        pending_readers = [a for a in self.loops.values() if a.read_only and not self._satisfied(a.id) and
+                           (a.parent == actor.id or a.transferred_to == actor.id)]
+        if pending_readers and traits['effect'] != 'read':
+            raise PermissionError('write barrier: finish or take over all read responsibilities first')
+        if traits['effect'] != 'read':
+            self.world_version += 1  # Failed/unknown writes may also have changed the shared world.
         output = self.invoke(name, args)
         fact = fingerprint([name, args, output])
         if fact not in actor.observed_facts:
@@ -880,14 +1035,17 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             actor.version += 1
         evidence_id = f"e{len(self.archive)}"
         self.archive[evidence_id] = {"tool": name, "arguments": args, "output": output,
-                                     "agent": actor.id, "version": actor.version}
+                                     "agent": actor.id, "version": actor.version,
+                                     "world_version": self.world_version, "traits": traits}
         actor.evidence.append(evidence_id)
         self.emit("tool_result", evidence_id=evidence_id, **self.archive[evidence_id])
         if self.scheduling == 'explicit' and not actor.first_observation:
             actor.first_observation = True
             self._checkpoint(actor, 'first_observation', actor.id,
                              {'evidence_id': evidence_id, 'meaning': 'First environment observation; assess the actual task state'})
-        for fact_info in collection_facts(output):
+        facts = collection_facts(output)
+        observe_source(self, actor, evidence_id, traits, facts)
+        for fact_info in facts:
             identity = fingerprint([name, args.get("app"), args.get("api"), fact_info])
             self._checkpoint(actor, "collection_observed", identity,
                              {**fact_info, "evidence_id": evidence_id,
@@ -898,12 +1056,14 @@ Do not report or delegate just to demonstrate activity. New observations can jus
         if previous and previous["agent"] != actor.id:
             # A factual local hint, not a parent wakeup and not an automatic merge/fold.
             observation = {"previous_evidence": previous["evidence_id"], "current_evidence": evidence_id,
-                           "same_output": previous["fact"] == fact}
+                           "same_output": previous["fact"] == fact,
+                           "same_world_version": previous.get('world_version') == self.world_version}
             self.emit("repeated_access", agent=actor.id, **observation)
-            if self.scheduling == 'explicit':
+            if self.scheduling == 'explicit' and observation['same_output'] and observation['same_world_version']:
                 self._checkpoint(actor, 'overlap', fingerprint([key, previous['agent'], previous['fact'], fact]), observation)
         if key is not None:
-            self.resources[key] = {"agent": actor.id, "evidence_id": evidence_id, "fact": fact}
+            self.resources[key] = {"agent": actor.id, "evidence_id": evidence_id, "fact": fact,
+                                   'world_version': self.world_version}
         return {"evidence_id": evidence_id, "result": output, "repeated_access": observation}
 
     def _satisfied(self, agent_id: str) -> bool:
@@ -952,6 +1112,9 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             self.emit("loop_failed", agent=actor.id, reason=error)
             self._notice(actor.parent, "failed", actor, {"reason": error, "work": asdict(actor.work)})
             return
+        if self.output_pressure_review and response.finish_reason == 'length':
+            self._capture_output_pressure(actor, response)
+            return
         message = copy.deepcopy(response.message)
         actor.messages.append(message)
         calls = message.get("tool_calls")
@@ -975,6 +1138,8 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                         raise ValueError(f"{name}: invalid arguments at {path} ({error.validator})")
                 reports = [args for _, name, args in parsed if name == "report_progress"]
                 names = [name for _, name, _ in parsed]
+                if actor.recovery_step is not None and (len(parsed) != 1 or names != [actor.recovery_step['tool']]):
+                    raise ValueError('bounded recovery must execute exactly its selected business tool')
                 if "load_tools" in names and any(name in self.tool_names for name in names):
                     raise ValueError("load_tools exposes schemas next request; do not guess business calls in its batch")
                 if "collaborate" in names and (names.count("collaborate") > 1 or set(names) - {"collaborate", "report_progress"}):
@@ -1031,6 +1196,10 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                         pending.append((actor, args))
                     else:
                         result = self._tool(actor, name, args)
+                        if name in self.tool_names and actor.recovery_step is not None:
+                            actor.recovery_step = None
+                            actor.output_pressure = None
+                            self.emit('recovery_step_completed', agent=actor.id, tool=name)
                 except Exception as exc:
                     result = {"error": type(exc).__name__, "detail": str(exc)}
                     route = json.dumps({"tool": call.get("function", {}).get("name"),
@@ -1043,12 +1212,20 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                                              {'tool': name, 'error': type(exc).__name__, 'detail': str(exc)})
                     self.emit("tool_error", agent=actor.id, tool=call.get("function", {}).get("name"),
                               error=type(exc).__name__)
+                    if isinstance(exc, PermissionError):
+                        self._notice(actor.parent, 'blocked', actor, {'tool': name, 'reason': str(exc)})
                 actor.messages.append({"role": "tool", "tool_call_id": call["id"],
                                        "content": json.dumps(result, ensure_ascii=False, default=str)})
             if reports and not report_error and "answer" in reports[0]:
                 self._finish_actor(actor, reports[0]["answer"])
             return
         text = message.get("content") or ""
+        if actor.recovery_step is not None:
+            actor.status = 'failed'
+            actor.version += 1
+            self.emit('loop_failed', agent=actor.id, reason='recovery_action_not_executed')
+            self._notice(actor.parent, 'failed', actor, {'reason': 'recovery_action_not_executed'})
+            return
         if response.finish_reason != "stop" or not text.strip() or "<｜DSML｜" in text:
             actor.status = "failed"
             actor.version += 1
@@ -1124,6 +1301,19 @@ Do not report or delegate just to demonstrate activity. New observations can jus
         wave = 0
         reason = "answered"
         while not self.final:
+            usage = aggregate_usage(self.calls)
+            if self.max_case_tokens is not None and usage['unreported_usage_requests']:
+                reason = 'case_budget_usage_unknown'
+                self.emit('case_budget_stopped', reason=reason, usage=usage)
+                break
+            if self.max_case_tokens is not None and usage['total_tokens'] >= self.max_case_tokens:
+                reason = 'case_token_budget'
+                self.emit('case_budget_stopped', reason=reason, usage=usage)
+                break
+            if self.max_case_requests is not None and len(self.calls) >= self.max_case_requests:
+                reason = 'case_request_budget'
+                self.emit('case_budget_stopped', reason=reason, usage=usage)
+                break
             self._poll_external()
             self._unblock()
             ready = [a for a in self.loops.values() if a.status == "ready" and
@@ -1134,6 +1324,8 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             if self.max_waves is not None and wave >= self.max_waves:
                 reason = "wave_limit"
                 break
+            if self.max_case_requests is not None:
+                ready = ready[:self.max_case_requests - len(self.calls)]
             wave += 1
             # The executor limit constrains simultaneous calls, not team size.
             for actor in ready:
@@ -1145,6 +1337,8 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                 # Independent normal solver calls below retain model concurrency.
                 actor = decisions[0]
                 state = actor.scheduling_candidate['state'] if actor.scheduling_candidate else snapshot(self, actor)
+                if self.compiled_triggers and actor.scheduling_candidate is None:
+                    self._compile_opportunity(actor, state)
                 self.emit('scheduling_started', agent=actor.id, snapshot_id=state['snapshot_id'],
                           event_ids=state['event_ids'], stage='commit' if actor.scheduling_candidate else 'decide')
                 response, error = self._request(actor, state)
@@ -1173,6 +1367,10 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                 "evidence": self.archive, "correctness": "not_evaluated",
                 "collaboration_mode": self.collaboration_mode,
                 "scheduling": self.scheduling,
+                "resource_limits": {'max_output_tokens': self.max_output_tokens,
+                    'max_case_tokens': self.max_case_tokens, 'max_case_requests': self.max_case_requests,
+                    'token_budget_enforcement': 'stop new calls after returned usage; an in-flight wave can overshoot',
+                    'scope': 'one case, all loop solver and control calls; benchmark scoring is separate'},
                 "metrics": {"execution_calls": sum(not r["contains_control"] for r in self.calls),
                             "control_calls": sum(r["contains_control"] for r in self.calls),
                             "collaboration_requests": sum(e["event"] == "collaboration_request" for e in self.events),
@@ -1183,6 +1381,9 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                             "explicit_keep_decisions": sum(e['event'] == 'scheduling_result' and e['decision'] == 'keep'
                                                            for e in self.events),
                             "scheduling_errors": sum(e['event'] == 'scheduling_error' for e in self.events),
+                            "compiled_trigger_count": sum(e['event'] == 'trigger_fired' for e in self.events),
+                            "output_pressure_count": sum(e['event'] == 'execution_output_truncated' for e in self.events),
+                            "recovery_steps_completed": sum(e['event'] == 'recovery_step_completed' for e in self.events),
                             "progress_checkpoints": sum(e["event"] == "progress_checkpoint" for e in self.events),
                             "task_state_updates": sum(e["event"] == "task_state_updated" for e in self.events),
                             "progress_protocol_errors": sum(e["event"] == "progress_protocol_error" for e in self.events),

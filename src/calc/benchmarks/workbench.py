@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -59,4 +60,10 @@ class WorkBenchAdapter:
     def session(self) -> EvaluationSession:
         # This sandbox is in-memory; the pinned implementation has no close hook.
         return EvaluationSession(tools=self.tools, invoke=self.invoke, context=CONTEXT,
-                                 evaluate=self.evaluate, close=None)
+                                 evaluate=self.evaluate, close=None, tool_traits=self.tool_traits)
+
+    def tool_traits(self, name, arguments):
+        tool = self._mapping[name]
+        return {'effect': 'write' if tool['side_effect'] else 'read',
+                'family': hashlib.sha256(json.dumps([name, arguments], sort_keys=True).encode()).hexdigest(),
+                'label': tool['name']}

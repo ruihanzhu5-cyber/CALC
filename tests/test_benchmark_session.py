@@ -21,7 +21,7 @@ def test_actor_capabilities_exclude_evaluation_and_metadata_and_close_after_fini
     session = make_session(evaluate=lambda answer: scored.append(answer) or {'native_result': 7})
     port = session.actor_environment()
     assert {f.name for f in fields(ActorEnvironment)} == {
-        'tools', 'invoke', 'context', 'events', 'is_final_submission'}
+        'tools', 'invoke', 'context', 'events', 'is_final_submission', 'tool_traits'}
     assert not hasattr(port, 'evaluate') and not hasattr(port, 'task')
     with pytest.raises(RuntimeError, match='during actor'):
         session.evaluate('premature')

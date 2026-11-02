@@ -1,0 +1,32 @@
+flowchart TB
+    TASK["用户任务 · Flash 执行 loop"]
+    subgraph CORE["CALC：按执行进展选择协作操作"]
+        direction TB
+        OBS["① 进展与事件账本<br/>完成 / 阻塞 / 依赖变化<br/>同版本重复访问"]
+        COMP["② 候选编译与预演 · 程序<br/>多个只读来源 → 顺序 / 并行候选<br/>读取重叠 → fold / merge 候选<br/>检查迁移约束<br/>编译下一次输入成本"]
+        DEC["③ 显式协作决策 · LLM<br/>比较 keep 与可行操作<br/>判断独立性、价值、风险；允许不切换"]
+        EXEC["④ 协作执行与职责迁移 · 程序<br/>delegate / review_refine<br/>merge / fold / wait<br/>递归分派 · 所有权版本<br/>只读权限 · 写入屏障"]
+        MEM["⑤ 工作与证据上下文<br/>未完目标 · 证据 ID · 失败路线<br/>技能与历史入口<br/>分派传必要种子<br/>收拢转移未完职责"]
+        OBS -->|公开结构性机会| COMP
+        COMP -->|可行候选与成本面板| DEC
+        DEC -->|keep 或批准操作| EXEC
+        EXEC -->|执行结果与状态变化| OBS
+        EXEC -->|更新与交接| MEM
+        MEM -->|职责与证据元数据| COMP
+        MEM -->|当前执行者的上下文| EXEC
+    end
+    ADAPT["Benchmark 适配层<br/>AppWorld：官方 HTTP 方法<br/>WorkBench：作者 side_effect 标记<br/>GAIA2：未知读写不自动推断"]
+    WORLD["同题共享任务环境<br/>工具按序提交 · 任务结束才调用官方评测"]
+    COST["贯穿计量与资源配置<br/>执行 + 控制请求全部计费记录<br/>单次输出默认服务端<br/>case 预算显式可选"]
+    TASK --> EXEC
+    EXEC -->|业务工具操作| ADAPT
+    ADAPT --> WORLD
+    ADAPT -->|观测与公开工具属性| OBS
+    COST -.-> DEC
+    COST -.-> EXEC
+    classDef program fill:#eaf2fb,stroke:#4c78a8,color:#18364f;
+    classDef model fill:#fff0d8,stroke:#c58a28,color:#604210;
+    classDef shared fill:#eaf5ed,stroke:#54876a,color:#254f37;
+    class OBS,COMP,EXEC program;
+    class TASK,DEC model;
+    class MEM,ADAPT,WORLD,COST shared;

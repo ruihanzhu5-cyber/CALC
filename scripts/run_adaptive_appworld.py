@@ -85,7 +85,7 @@ def main() -> int:
             for p in [ROOT / "src/calc/adaptive.py", ROOT / "src/calc/progress.py",
                       ROOT / "src/calc/benchmarks/appworld.py", ROOT / "src/calc/benchmarks/session.py",
                       ROOT / "src/calc/llm.py", ROOT / "src/calc/capabilities.py",
-                      ROOT / "src/calc/protocol.py", ROOT / "src/calc/scheduling.py",
+                      ROOT / "src/calc/protocol.py", ROOT / "src/calc/scheduling.py", ROOT / "src/calc/triggers.py",
                       ROOT / "pyproject.toml", Path(__file__)]},
         "config": cfg, "runtime": options,
         "allowed_initial_operations": sorted(allowed_operations(mode, True, True)),

@@ -125,7 +125,8 @@ def main():
             for f in [Path(__file__), ROOT / 'src/calc/adaptive.py', ROOT / 'src/calc/benchmarks/gaia2.py',
                       ROOT / 'src/calc/benchmarks/manta_transport.py', ROOT / 'src/calc/progress.py',
                       ROOT / 'src/calc/benchmarks/session.py', ROOT / 'src/calc/capabilities.py',
-                      ROOT / 'src/calc/protocol.py', ROOT / 'src/calc/scheduling.py', ROOT / 'pyproject.toml']},
+                      ROOT / 'src/calc/protocol.py', ROOT / 'src/calc/scheduling.py',
+                      ROOT / 'src/calc/triggers.py', ROOT / 'pyproject.toml']},
         "preflight": not args.execute})
     started = time.perf_counter()
     adapter, actor_client, judge_client, manta_http, session = None, None, None, None, None

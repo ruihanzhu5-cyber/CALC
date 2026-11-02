@@ -112,6 +112,19 @@ class AppWorldAdapter:
             self.world.save_logs()
             self.phase = "evaluation"
 
+    def tool_traits(self, name: str, args: dict) -> dict:
+        """Only public official API docs; no name-based read/write guessing."""
+        app, api = args.get('app'), args.get('api')
+        docs = self.world.task.api_docs
+        if name != 'appworld_api' or app not in docs or api not in docs[app]:
+            return {'effect': 'unknown', 'family': name, 'label': name}
+        method = docs[app][api]['method'].upper()
+        parameters = {k: v for k, v in args.get('arguments', {}).items()
+                      if k not in {'page_index', 'page_limit'}}
+        family = hashlib.sha256(json.dumps([app, api, parameters], sort_keys=True).encode()).hexdigest()
+        return {'effect': 'read' if method in {'GET', 'HEAD'} else 'write',
+                'family': family, 'label': f'{app}.{api}'}
+
     def evaluate(self) -> dict:
         if self.phase != "evaluation":
             raise RuntimeError("official scoring is unavailable during actor execution")
@@ -128,5 +141,5 @@ class AppWorldAdapter:
     def session(self) -> EvaluationSession:
         return EvaluationSession(tools=self.tools, invoke=self.invoke, context=PUBLIC_CONTEXT,
             finish=self.finish, evaluate=lambda answer: self.evaluate(), close=self.close,
-            is_final_submission=lambda name, args: name == "appworld_api"
+            tool_traits=self.tool_traits, is_final_submission=lambda name, args: name == "appworld_api"
                 and args.get("app") == "supervisor" and args.get("api") == "complete_task")

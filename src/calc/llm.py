@@ -85,14 +85,16 @@ class OpenAICompatibleClient:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
-        max_output_tokens: int = 1024,
+        max_output_tokens: int | None = None,
     ) -> ChatResponse:
-        if max_output_tokens < 1:
+        if max_output_tokens is not None and (type(max_output_tokens) is not int or max_output_tokens < 1):
             raise ValueError("max_output_tokens must be positive")
         body: dict[str, Any] = {
             **self.extra_body, "model": self.model, "messages": messages,
-            "stream": False, self.output_token_field: max_output_tokens,
+            "stream": False,
         }
+        if max_output_tokens is not None:
+            body[self.output_token_field] = max_output_tokens
         if self.temperature is not None:
             body["temperature"] = self.temperature
         if self.reasoning_effort is not None:

@@ -27,6 +27,9 @@ def decision_tools(collaborate: dict) -> tuple[dict, dict]:
         proposal['properties'].pop(key)
     proposal['properties']['operation']['enum'] = ['delegate', 'merge', 'fold', 'escalate', 'respond']
     proposal['required'] = ['operation', 'reason', 'proposed_next', 'expected_savings', 'risks', 'handoff']
+    recovery = {'type': 'object', 'additionalProperties': False,
+                'properties': {'goal': {'type': 'string', 'minLength': 1},
+                               'tool': {'type': 'string', 'minLength': 1}}, 'required': ['goal', 'tool']}
     properties = {
         'decision': {'type': 'string', 'enum': ['keep', 'defer', 'candidate']},
         'reason': {'type': 'string', 'minLength': 1},
@@ -35,6 +38,7 @@ def decision_tools(collaborate: dict) -> tuple[dict, dict]:
         'covered_work_ids': {'type': 'array', 'items': {'type': 'string'}, 'uniqueItems': True},
         'dependencies': {'type': 'array', 'items': {'type': 'string'}, 'uniqueItems': True},
         'proposal': proposal,
+        'recovery_step': recovery,
     }
     schema = {'type': 'object', 'properties': properties, 'additionalProperties': False,
               'required': ['decision', 'reason', 'next_work', 'evidence_ids'],
@@ -55,7 +59,8 @@ def decision_tools(collaborate: dict) -> tuple[dict, dict]:
         'description': 'After inspecting compiled input/transfer costs, commit the candidate or keep the original work. '
                        'Estimates are not measured savings or success probabilities.',
         'parameters': {'type': 'object', 'additionalProperties': False,
-            'properties': {'commit': {'type': 'boolean'}, 'reason': {'type': 'string', 'minLength': 1}},
+            'properties': {'commit': {'type': 'boolean'}, 'reason': {'type': 'string', 'minLength': 1},
+                           'recovery_step': recovery},
             'required': ['commit', 'reason']}}}
     return decide, confirm
 
@@ -68,7 +73,9 @@ def snapshot(runtime, actor) -> dict:
     for a in relevant:
         if a.status in {'ready', 'waiting', 'review', 'failed'} and not a.resolved:
             units.append({'work_id': 'scope:' + a.id, 'owner': a.id, 'work': asdict(a.work),
-                          'dependencies': a.dependencies, 'subgoals': a.subgoals})
+                          'dependencies': a.dependencies, 'subgoals': a.subgoals,
+                          'progress_report_stale': a.latest_report is None or
+                              a.progress_reports[a.latest_report]['version'] != a.version})
         elif a.transferred_to in {u.id for u in relevant} and not a.resolved:
             units.append({'work_id': 'scope:' + a.id, 'owner': a.transferred_to,
                           'work': asdict(a.work), 'dependencies': a.dependencies, 'subgoals': a.subgoals})
@@ -86,6 +93,8 @@ def snapshot(runtime, actor) -> dict:
         'allowed_operations': sorted(allowed_operations(runtime.collaboration_mode,
                                                         runtime.initial_open, actor.parent is None)),
         'suggestion': copy.deepcopy(actor.scheduling_suggestion),
+        'world_version': runtime.world_version,
+        'output_pressure': copy.deepcopy(actor.output_pressure),
     }
     state['snapshot_id'] = fingerprint(state)
     return state

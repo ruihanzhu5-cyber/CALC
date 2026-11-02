@@ -33,11 +33,15 @@
   },
   "runtime": {
     "scheduling": "explicit",
+    "compiled_triggers": true,
+    "output_pressure_review": false,
+    "max_case_tokens": null,
+    "max_case_requests": null,
     "progress_checkpoints": true,
     "collaboration_mode": "full",
     "tool_loading": "all",
     "concurrency": 3,
-    "max_output_tokens": 4096,
+    "max_output_tokens": null,
     "max_waves": null
   },
   "environment": {

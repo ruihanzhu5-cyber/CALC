@@ -7,7 +7,7 @@
     "strong": {"model": "deepseek-flash", "base_url": "https://api.deepseek.com/v1", "key_env": "DEEPSEEK_API_KEY", "temperature": 0},
     "weak": {"model": "deepseek-flash", "base_url": "https://api.deepseek.com/v1", "key_env": "DEEPSEEK_API_KEY", "temperature": 0}
   },
-  "runtime": {"collaboration_mode": "full", "scheduling": "explicit", "progress_checkpoints": true, "tool_loading": "deferred", "concurrency": 3, "max_output_tokens": 4096, "max_waves": null},
+  "runtime": {"collaboration_mode": "full", "scheduling": "explicit", "compiled_triggers": true, "output_pressure_review": false, "progress_checkpoints": true, "tool_loading": "deferred", "concurrency": 3, "max_output_tokens": null, "max_case_tokens": null, "max_case_requests": null, "max_waves": null},
   "skills": {
     "verify_dependencies": {
       "description": "Check identifiers and prerequisites before a state-changing workplace action.",
