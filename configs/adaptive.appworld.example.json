@@ -32,6 +32,7 @@
     }
   },
   "runtime": {
+    "scheduling": "explicit",
     "progress_checkpoints": true,
     "collaboration_mode": "full",
     "tool_loading": "all",

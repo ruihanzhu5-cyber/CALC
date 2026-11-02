@@ -44,7 +44,7 @@ def main() -> int:
     manifest["calc_source_sha256"] = {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in
         ["src/calc/adaptive.py", "src/calc/progress.py", "src/calc/llm.py", "scripts/run_adaptive_workbench.py",
          "src/calc/benchmarks/session.py", "src/calc/benchmarks/workbench.py",
-         "src/calc/capabilities.py", "src/calc/protocol.py", "pyproject.toml"]}
+         "src/calc/capabilities.py", "src/calc/protocol.py", "src/calc/scheduling.py", "pyproject.toml"]}
     manifest["skills"] = cfg.get("skills", {})
     manifest["allowed_initial_operations"] = sorted(allowed_operations(mode, True, True))
     manifest["allowed_later_operations"] = sorted(allowed_operations(mode, False, True))

@@ -12,12 +12,15 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from time import perf_counter
+from threading import RLock
 from typing import Any, Callable
 from jsonschema import Draft202012Validator
 
 from calc.llm import aggregate_usage
 from calc.capabilities import ToolRegistry
 from calc.protocol import parse_tool_calls
+from calc.scheduling import (decision_tools, snapshot, assert_current, normalize_candidate,
+                             preview, cost_panel, StaleDecisionError)
 from calc.progress import (WorkReport, MODES, EVENT_TYPES, OPERATIONS, allowed_operations,
                            fingerprint, validate_proposal, collection_facts, validate_subgoals)
 
@@ -176,6 +179,10 @@ class Loop:
     allowed_tools: list[str] = field(default_factory=list)
     loaded_tools: list[str] = field(default_factory=list)
     history_snapshots: dict[str, list[dict]] = field(default_factory=dict)
+    scheduling_candidate: dict | None = None
+    scheduling_suggestion: dict | None = None
+    scheduling_wait: dict[str, list] = field(default_factory=dict)
+    first_observation: bool = False
 
 
 class AdaptiveRuntime:
@@ -186,6 +193,7 @@ class AdaptiveRuntime:
                  environment_context: str = "", collaboration_mode: str = "full",
                  resource_key: Callable[[str, dict], str | None] | None = None,
                  progress_checkpoints: bool = True,
+                 scheduling: str = "voluntary",
                  tool_loading: str = "all",
                  is_final_submission: Callable[[str, dict], bool] | None = None,
                  external_events: Callable[[], list[dict]] | None = None,
@@ -193,7 +201,8 @@ class AdaptiveRuntime:
         if concurrency < 1 or max_output_tokens < 1 or (max_waves is not None and max_waves < 1):
             raise ValueError("positive concurrency/output/wave limits required")
         reserved = {"collaborate", "report_progress", "load_skill", "read_evidence", "read_history",
-                    "complete_transferred_work", "discover_tools", "load_tools"}
+                    "complete_transferred_work", "discover_tools", "load_tools",
+                    "decide_collaboration", "commit_collaboration"}
         names = [t["function"]["name"] for t in tools]
         if reserved.intersection(names) or len(set(names)) != len(names):
             raise ValueError("duplicate or reserved tool names")
@@ -201,6 +210,14 @@ class AdaptiveRuntime:
         self.tools = copy.deepcopy(tools)
         self.tool_names = set(names)
         self.registry = ToolRegistry(tools)
+        if scheduling not in {"voluntary", "explicit"}:
+            raise ValueError("scheduling must be voluntary or explicit")
+        if scheduling == "explicit" and not progress_checkpoints:
+            raise ValueError("explicit scheduling requires progress_checkpoints")
+        self.scheduling = scheduling
+        self.decide_tool, self.commit_tool = decision_tools(COLLABORATE)
+        self.emit_lock = RLock()
+        self.request_serial = 0
         control = [REPORT_PROGRESS, COLLABORATE, LOAD_SKILL, READ_EVIDENCE,
                    READ_HISTORY, COMPLETE_WORK, DISCOVER_TOOLS, LOAD_TOOLS]
         self.validators = {t["function"]["name"]: Draft202012Validator(t["function"]["parameters"])
@@ -232,15 +249,17 @@ class AdaptiveRuntime:
         self.requests: dict[str, dict] = {}
         self.seen_proposals: set[str] = set()
         self.seen_notices: set[str] = set()
+        self.seen_schedule_candidates: set[str] = set()
         self.resources: dict[str, dict] = {}
         # Bind a real monotonic clock before benchmark time-freezing is installed.
         self.clock = clock
 
     def emit(self, kind: str, **values: Any) -> None:
-        event = {"index": len(self.events), "event": kind, **values}
-        self.events.append(event)
-        if self.event_sink:
-            self.event_sink(event)
+        with self.emit_lock:
+            event = {"index": len(self.events), "event": kind, **values}
+            self.events.append(event)
+            if self.event_sink:
+                self.event_sink(event)
 
     def _new(self, goal: str, parent: str | None, tier: str, skills: list[str]) -> Loop:
         name = "main" if parent is None else f"agent_{len(self.loops)}"
@@ -273,7 +292,13 @@ class AdaptiveRuntime:
 
     def _messages(self, actor: Loop) -> list[dict]:
         catalog = {k: v["description"] for k, v in self.skills.items()}
-        system = POLICY + "\n" + self.environment_context
+        policy = POLICY if self.scheduling == "voluntary" else POLICY.split("Progress checkpoints are facts")[0] + """
+The runtime schedules explicit collaboration decisions when new work events arrive.
+In normal execution, continue local tools; report_progress remains optional. A collaborate call
+is a suggestion for the same explicit decision stage, not a second direct transition path.
+Do not report or delegate just to demonstrate activity. New observations can justify keeping the team.
+"""
+        system = policy + "\n" + self.environment_context
         system += f"\nYou are {actor.id}. Parent: {actor.parent}. Skills: {json.dumps(catalog)}"
         system += "\nCurrent team state: " + self._state(actor)
         system += "\nAllowed collaboration operations: " + json.dumps(sorted(
@@ -290,15 +315,48 @@ class AdaptiveRuntime:
             system += "\nLoaded tool names: " + json.dumps(actor.loaded_tools)
         return [{"role": "system", "content": system}, *copy.deepcopy(actor.messages)]
 
-    def _request(self, actor: Loop):
+    def execution_controls(self) -> list[dict]:
+        return [REPORT_PROGRESS, COLLABORATE, LOAD_SKILL, READ_EVIDENCE, READ_HISTORY, COMPLETE_WORK,
+                *([DISCOVER_TOOLS, LOAD_TOOLS] if self.tool_loading == "deferred" else [])]
+
+    def _request(self, actor: Loop, scheduling_state: dict | None = None):
+        messages = self._messages(actor)
+        tools = [*self.registry.scoped(actor.allowed_tools).load(actor.loaded_tools), *self.execution_controls()]
+        if scheduling_state is not None:
+            committing = actor.scheduling_candidate is not None
+            tools = [self.commit_tool if committing else self.decide_tool]
+            body = actor.scheduling_candidate if committing else scheduling_state
+            messages.append({"role": "user", "content":
+                ("COMMIT STAGE. Inspect the same-work cost panel. Call commit_collaboration exactly once; "
+                 "commit=false resumes the original session. No business tools or answer.\n" if committing else
+                 "DECIDE STAGE. Call decide_collaboration exactly once. Compare unchanged continuation with "
+                 "a useful fixed-operation candidate; keep is fully valid. Cover exactly all work_ids. "
+                 "Read the task and observations to identify new dependencies or independent goals; "
+                 "a prior report_progress is NOT required. Preserve unfinished objectives and completion "
+                 "conditions; role differences or collection size alone do not justify delegation. "
+                 "Use next_work to state who does what next. Defer only to live direct children. "
+                 "Do not create teams for easy work, but do not keep serial work merely because the current "
+                 "loop can eventually do it: consider genuinely independent goals, context isolation and "
+                 "required verification. No business tools or answer in this stage.\n") +
+                json.dumps(body, ensure_ascii=False)})
+        purpose = ("collaboration_commit" if actor.scheduling_candidate else "collaboration_decision") \
+            if scheduling_state is not None else "execute"
+        with self.emit_lock:
+            request_id = f"model-{self.request_serial}"
+            self.request_serial += 1
+        self.emit("model_request_started", request_id=request_id, agent=actor.id, purpose=purpose,
+                  input_utf8_bytes=len(json.dumps({'messages': messages, 'tools': tools},
+                                                  ensure_ascii=False).encode()))
         try:
-            return self.clients[actor.tier].complete(self._messages(actor),
-                tools=[*self.registry.scoped(actor.allowed_tools).load(actor.loaded_tools),
-                       REPORT_PROGRESS, COLLABORATE, LOAD_SKILL, READ_EVIDENCE, READ_HISTORY, COMPLETE_WORK,
-                       *([DISCOVER_TOOLS, LOAD_TOOLS] if self.tool_loading == "deferred" else [])],
-                max_output_tokens=self.max_output_tokens), None
+            response = self.clients[actor.tier].complete(messages, tools=tools,
+                                                       max_output_tokens=self.max_output_tokens)
+            self.emit("model_request_finished", request_id=request_id, agent=actor.id, purpose=purpose,
+                      response_id=response.response_id)
+            return response, None
         except Exception as exc:
             # No hidden retry; failed transports may have consumed tokens.
+            self.emit("model_request_failed", request_id=request_id, agent=actor.id, purpose=purpose,
+                      error=type(exc).__name__)
             return None, type(exc).__name__
 
     def _record_call(self, actor: str, tier: str, response: Any, error: str | None,
@@ -311,7 +369,8 @@ class AdaptiveRuntime:
                "purpose": purpose, "usage": response.usage.to_dict() if response else {},
                "error": error, "finish_reason": response.finish_reason if response else None,
                "elapsed_seconds": response.elapsed_seconds if response else None,
-               "contains_control": bool(names & {"collaborate", "report_progress"}),
+               "response_id": response.response_id if response else None,
+               "contains_control": purpose != "execute" or bool(names & {"collaborate", "report_progress"}),
                "contains_progress": "report_progress" in names}
         self.calls.append(row)
         self.emit("model_call", **row)
@@ -327,6 +386,104 @@ class AdaptiveRuntime:
         actor.checkpoints[cid] = {"id": cid, "type": kind, "details": copy.deepcopy(details)}
         self.emit("progress_checkpoint", agent=actor.id, checkpoint=actor.checkpoints[cid])
         return cid
+
+    def _accept_decision(self, actor: Loop, response: Any, error: str | None, state: dict) -> None:
+        """One explicit control stage; no business actions or implicit JSON repair."""
+        committing = actor.scheduling_candidate is not None
+        purpose = "collaboration_commit" if committing else "collaboration_decision"
+        self._record_call(actor.id, actor.tier, response, error, purpose)
+        self.emit("scheduling_response", agent=actor.id, purpose=purpose,
+                  message=response.message if response else None,
+                  finish_reason=response.finish_reason if response else None)
+        try:
+            if error:
+                raise RuntimeError(error)
+            if response.finish_reason != "tool_calls":
+                raise ValueError("decision must be a complete native tool call")
+            calls = parse_tool_calls(response.message.get("tool_calls"))
+            tool = self.commit_tool if committing else self.decide_tool
+            if len(calls) != 1 or calls[0][1] != tool['function']['name']:
+                raise ValueError("one decision call and no business actions required")
+            call, _, data = calls[0]
+            Draft202012Validator(tool['function']['parameters']).validate(data)
+            assert_current(self, actor, state)
+            if data['snapshot_id'] != state['snapshot_id']:
+                raise ValueError("wrong snapshot_id")
+            # Complete the real call protocol before a transition archives history.
+            actor.messages.append(copy.deepcopy(response.message))
+            actor.messages.append({'role': 'tool', 'tool_call_id': call['id'],
+                                   'content': json.dumps({'decision_received': True})})
+            if committing:
+                item = actor.scheduling_candidate
+                if data['commit']:
+                    outcome = self.change(actor.id, item['proposal'])
+                    selected = 'commit'
+                else:
+                    outcome, selected = {'continue_original_session': True}, 'keep'
+                actor.scheduling_candidate = None
+                self._consume_checkpoints(actor, state['event_ids'])
+                actor.scheduling_suggestion = None
+                actor.scheduling_wait = {}
+                self.emit('scheduling_result', agent=actor.id, snapshot_id=state['snapshot_id'],
+                          decision=selected, reason=data['reason'], outcome=outcome)
+                actor.messages.append({'role': 'user', 'content': 'Scheduling outcome: ' + json.dumps(outcome)})
+                return
+            if set(data['event_ids']) != set(state['event_ids']):
+                raise ValueError('decision must acknowledge exactly this event batch')
+            if set(data['covered_work_ids']) != {u['work_id'] for u in state['work']}:
+                raise ValueError('candidate/keep must cover the same unfinished work IDs')
+            if any(e not in actor.evidence for e in data['evidence_ids']):
+                raise ValueError('decision evidence unavailable to this owner')
+            choice = data['decision']
+            if choice == 'candidate':
+                proposal = normalize_candidate(actor, state, data)
+                signature = fingerprint([actor.id, proposal, state['versions'], actor.observed_facts])
+                if signature in self.seen_schedule_candidates:
+                    raise ValueError('same proposal without new work or evidence')
+                shadow = preview(self, actor.id, proposal)
+                panel = cost_panel(self, shadow, state)
+                self.seen_schedule_candidates.add(signature)
+                actor.scheduling_candidate = {'snapshot_id': state['snapshot_id'], 'state': state,
+                                              'proposal': proposal, 'cost_panel': panel}
+                self.emit('scheduling_candidate', agent=actor.id, snapshot_id=state['snapshot_id'],
+                          covered_work_ids=data['covered_work_ids'], proposal=proposal, cost_panel=panel)
+                return
+            if any(r['parent'] == actor.id and r['status'] == 'pending' for r in self.requests.values()):
+                raise ValueError('decide pending child requests before keep/defer')
+            if choice == 'defer':
+                children = {a.id: a for a in self._live_children(actor.id)}
+                if any(d not in children for d in data['dependencies']):
+                    raise ValueError('defer requires live direct-child dependencies')
+                if any(children[d].status == 'review' for d in data['dependencies']):
+                    raise ValueError('cannot defer to a child waiting for your approval')
+                actor.scheduling_wait = {d: [children[d].status, children[d].resolved]
+                                         for d in data['dependencies']}
+                actor.status = 'waiting'
+            else:
+                actor.scheduling_wait = {}
+            actor.work.next_step = data['next_work']
+            self._consume_checkpoints(actor, state['event_ids'])
+            actor.scheduling_suggestion = None
+            if actor.parent is None:
+                self.initial_open = False
+            self.emit('scheduling_result', agent=actor.id, snapshot_id=state['snapshot_id'],
+                      decision=choice, reason=data['reason'], next_work=data['next_work'],
+                      next_executors=data.get('dependencies', [actor.id]),
+                      covered_work_ids=data['covered_work_ids'])
+        except StaleDecisionError:
+            actor.scheduling_candidate = None
+            self.emit('scheduling_invalidated', agent=actor.id, snapshot_id=state['snapshot_id'],
+                      reason='new state; no transition or business action committed')
+            if actor.status in {'ready', 'waiting'}:
+                actor.status = 'ready'
+                self._checkpoint(actor, 'decision_invalidated', fingerprint(snapshot(self, actor)),
+                                 {'previous_snapshot': state['snapshot_id']})
+        except Exception as exc:
+            actor.status = 'failed'
+            actor.version += 1
+            self.emit('scheduling_error', agent=actor.id, purpose=purpose,
+                      error=type(exc).__name__, detail=str(exc))
+            self._notice(actor.parent, 'failed', actor, {'reason': 'scheduling_error', 'work': asdict(actor.work)})
 
     def _report_progress(self, actor: Loop, p: dict, request_version: int | None = None,
                          checkpoint_ids: list[str] | None = None) -> dict:
@@ -365,7 +522,10 @@ class AdaptiveRuntime:
         actor.version += 1
         if plan_changed:
             self._checkpoint(actor, "plan_changed", fingerprint(goals), {"subgoals": goals})
-        assessed = [actor.checkpoints.pop(c) for c in acknowledged]
+        assessed = [copy.deepcopy(actor.checkpoints[c]) for c in acknowledged]
+        if self.scheduling == "voluntary":
+            for cid in acknowledged:
+                actor.checkpoints.pop(cid)
         actor.progress_reports[p["report_id"]] = {"input": copy.deepcopy(p), "version": actor.version,
             "work": asdict(actor.work), "evidence_ids": list(p["evidence_ids"]), "checkpoints": assessed}
         actor.latest_report = p["report_id"]
@@ -426,7 +586,8 @@ class AdaptiveRuntime:
         consumed = [cid for cid in ids if actor.checkpoints.pop(cid, None) is not None]
         if consumed:
             self.emit("checkpoint_consumed", agent=actor.id, checkpoint_ids=consumed,
-                      meaning="Observed by a normal decision; no organization change implied")
+                      meaning="Explicit scheduling choice" if self.scheduling == "explicit" else
+                              "Observed by a normal decision; no organization change implied")
 
     def change(self, actor_id: str, p: dict) -> dict:
         actor = self.loops[actor_id]
@@ -630,9 +791,9 @@ class AdaptiveRuntime:
         receiver.history_refs = list(dict.fromkeys(receiver.history_refs + source_ids +
                                                   [h for a in sources for h in a.history_refs]))
         for source in sources:
-            for ref, snapshot in source.history_snapshots.items():
+            for ref, history_snapshot in source.history_snapshots.items():
                 if ref not in receiver.history_snapshots:
-                    receiver.history_snapshots[ref] = copy.deepcopy(snapshot)
+                    receiver.history_snapshots[ref] = copy.deepcopy(history_snapshot)
             receiver.history_snapshots[source.id] = copy.deepcopy(source.messages)
         receiver.allowed_tools = list(dict.fromkeys(receiver.allowed_tools +
                                                     [t for a in sources for t in a.allowed_tools]))
@@ -723,6 +884,10 @@ class AdaptiveRuntime:
                                      "agent": actor.id, "version": actor.version}
         actor.evidence.append(evidence_id)
         self.emit("tool_result", evidence_id=evidence_id, **self.archive[evidence_id])
+        if self.scheduling == 'explicit' and not actor.first_observation:
+            actor.first_observation = True
+            self._checkpoint(actor, 'first_observation', actor.id,
+                             {'evidence_id': evidence_id, 'meaning': 'First environment observation; assess the actual task state'})
         for fact_info in collection_facts(output):
             identity = fingerprint([name, args.get("app"), args.get("api"), fact_info])
             self._checkpoint(actor, "collection_observed", identity,
@@ -736,6 +901,8 @@ class AdaptiveRuntime:
             observation = {"previous_evidence": previous["evidence_id"], "current_evidence": evidence_id,
                            "same_output": previous["fact"] == fact}
             self.emit("repeated_access", agent=actor.id, **observation)
+            if self.scheduling == 'explicit':
+                self._checkpoint(actor, 'overlap', fingerprint([key, previous['agent'], previous['fact'], fact]), observation)
         if key is not None:
             self.resources[key] = {"agent": actor.id, "evidence_id": evidence_id, "fact": fact}
         return {"evidence_id": evidence_id, "result": output, "repeated_access": observation}
@@ -745,6 +912,17 @@ class AdaptiveRuntime:
 
     def _unblock(self) -> None:
         for actor in self.loops.values():
+            if actor.scheduling_wait:
+                changed = [d for d, old in actor.scheduling_wait.items()
+                           if [self.loops[d].status, self.loops[d].resolved] != old]
+                if changed:
+                    self._checkpoint(actor, 'dependency_changed', fingerprint(
+                        [(d, self.loops[d].status, self.loops[d].resolved) for d in changed]),
+                        {'dependencies': changed})
+                    actor.scheduling_wait = {}
+                    actor.status = 'ready'
+                elif actor.status == 'waiting':
+                    continue
             for dep in actor.dependencies:
                 predecessor = self.loops[dep]
                 if self._satisfied(dep) and dep not in actor.completed_dependencies:
@@ -838,7 +1016,8 @@ class AdaptiveRuntime:
                     report_error = True
                     report_result = {"error": type(exc).__name__, "detail": str(exc)}
                     self.emit("progress_report_error", agent=actor.id, error=str(exc))
-            self._consume_checkpoints(actor, required)
+            if self.scheduling == 'voluntary':
+                self._consume_checkpoints(actor, required)
             if actor.parent is None and any(name in self.tool_names for name in names):
                 self.initial_open = False
             for call, name, args in parsed:
@@ -860,6 +1039,9 @@ class AdaptiveRuntime:
                     if route not in actor.work.failed_routes:
                         actor.work.failed_routes.append(route)
                         actor.version += 1
+                        if self.scheduling == 'explicit':
+                            self._checkpoint(actor, 'blocked', fingerprint(route),
+                                             {'tool': name, 'error': type(exc).__name__, 'detail': str(exc)})
                     self.emit("tool_error", agent=actor.id, tool=call.get("function", {}).get("name"),
                               error=type(exc).__name__)
                 actor.messages.append({"role": "tool", "tool_call_id": call["id"],
@@ -875,7 +1057,8 @@ class AdaptiveRuntime:
             self._notice(actor.parent, "failed", actor,
                          {"reason": "no_complete_answer", "work": asdict(actor.work)})
             return
-        self._consume_checkpoints(actor, required)
+        if self.scheduling == 'voluntary':
+            self._consume_checkpoints(actor, required)
         self._finish_actor(actor, text)
 
     def _finish_actor(self, actor: Loop, text: str) -> None:
@@ -935,6 +1118,7 @@ class AdaptiveRuntime:
             main.status, main.resolved, self.final = "ready", False, ""
             main.messages.append({"role": "user", "content": instruction})
             main.version += 1
+            main.first_observation = False
             self._checkpoint(main, "user_turn", str(main.version), {"instruction": instruction})
         else:
             self._new(instruction, None, "strong", [])
@@ -955,6 +1139,18 @@ class AdaptiveRuntime:
             # The executor limit constrains simultaneous calls, not team size.
             for actor in ready:
                 self._deliver_notices(actor)
+            decisions = [a for a in ready if self.scheduling == 'explicit' and
+                         (a.checkpoints or a.scheduling_candidate)]
+            if decisions:
+                # Organization decisions are serialized at a shared-world barrier.
+                # Independent normal solver calls below retain model concurrency.
+                actor = decisions[0]
+                state = actor.scheduling_candidate['state'] if actor.scheduling_candidate else snapshot(self, actor)
+                self.emit('scheduling_started', agent=actor.id, snapshot_id=state['snapshot_id'],
+                          event_ids=state['event_ids'], stage='commit' if actor.scheduling_candidate else 'decide')
+                response, error = self._request(actor, state)
+                self._accept_decision(actor, response, error, state)
+                continue
             required = {a.id: (list(a.checkpoints), a.version, a.owner_epoch) for a in ready}
             with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
                 responses = list(pool.map(self._request, ready))
@@ -962,6 +1158,10 @@ class AdaptiveRuntime:
             for actor, (response, error) in zip(ready, responses):
                 self._accept(actor, response, error, pending, *required[actor.id])
             for actor, proposal in pending:
+                if self.scheduling == 'explicit':
+                    actor.scheduling_suggestion = copy.deepcopy(proposal)
+                    self._checkpoint(actor, 'adjustment_requested', fingerprint(proposal), {'proposal': proposal})
+                    continue
                 try:
                     outcome = self.change(actor.id, proposal)
                 except (ValueError, KeyError, TypeError) as exc:
@@ -973,11 +1173,17 @@ class AdaptiveRuntime:
                 "calls": self.calls, "events": self.events, "loops": {k: asdict(v) for k, v in self.loops.items()},
                 "evidence": self.archive, "correctness": "not_evaluated",
                 "collaboration_mode": self.collaboration_mode,
+                "scheduling": self.scheduling,
                 "metrics": {"execution_calls": sum(not r["contains_control"] for r in self.calls),
                             "control_calls": sum(r["contains_control"] for r in self.calls),
                             "collaboration_requests": sum(e["event"] == "collaboration_request" for e in self.events),
                             "switches": sum(e["event"] in {"delegate", "merge", "fold", "escalate"} for e in self.events),
                             "progress_calls": sum(r["contains_progress"] for r in self.calls),
+                            "scheduling_decision_calls": sum(r['purpose'] == 'collaboration_decision' for r in self.calls),
+                            "scheduling_commit_calls": sum(r['purpose'] == 'collaboration_commit' for r in self.calls),
+                            "explicit_keep_decisions": sum(e['event'] == 'scheduling_result' and e['decision'] == 'keep'
+                                                           for e in self.events),
+                            "scheduling_errors": sum(e['event'] == 'scheduling_error' for e in self.events),
                             "progress_checkpoints": sum(e["event"] == "progress_checkpoint" for e in self.events),
                             "task_state_updates": sum(e["event"] == "task_state_updated" for e in self.events),
                             "progress_protocol_errors": sum(e["event"] == "progress_protocol_error" for e in self.events),

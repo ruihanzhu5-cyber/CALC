@@ -114,7 +114,8 @@ def test_public_schema_copy_cannot_change_session_tool_catalog():
 
 def test_final_submission_classifier_is_public_fact_not_evaluation(monkeypatch):
     scored, received = [], {}
-    classifier = lambda name, args: name == 'read' and args.get('final') is True
+    def classifier(name, args):
+        return name == 'read' and args.get('final') is True
     session = make_session(is_final_submission=classifier,
                            evaluate=lambda answer: scored.append(answer))
     port = session.actor_environment()
