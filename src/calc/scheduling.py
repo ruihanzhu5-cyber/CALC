@@ -34,14 +34,13 @@ def decision_tools(collaborate: dict) -> tuple[dict, dict]:
         'decision': {'type': 'string', 'enum': ['keep', 'defer', 'candidate']},
         'reason': {'type': 'string', 'minLength': 1},
         'next_work': {'type': 'string', 'minLength': 1},
-        'evidence_ids': {'type': 'array', 'items': {'type': 'string'}, 'uniqueItems': True},
         'covered_work_ids': {'type': 'array', 'items': {'type': 'string'}, 'uniqueItems': True},
         'dependencies': {'type': 'array', 'items': {'type': 'string'}, 'uniqueItems': True},
         'proposal': proposal,
         'recovery_step': recovery,
     }
     schema = {'type': 'object', 'properties': properties, 'additionalProperties': False,
-              'required': ['decision', 'reason', 'next_work', 'evidence_ids'],
+              'required': ['decision', 'reason', 'next_work'],
               'allOf': [
                   {'if': {'properties': {'decision': {'const': 'candidate'}}},
                    'then': {'required': ['proposal', 'covered_work_ids'], 'not': {'required': ['dependencies']}},
@@ -112,7 +111,7 @@ def normalize_candidate(actor, state: dict, decision: dict) -> dict:
     event_type = next((e['type'] for e in state['events']
                        if e['type'] in {'task_start', 'blocked', 'conflict', 'overlap', 'dependency_changed'}), 'progress')
     return {**proposal, 'event_type': event_type, 'event_version': actor.version,
-            'progress': asdict(actor.work), 'evidence_ids': decision['evidence_ids'],
+            'progress': asdict(actor.work), 'evidence_ids': list(state['evidence_ids']),
             'baseline_next': actor.work.next_step}
 
 

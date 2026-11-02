@@ -383,7 +383,7 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                  "No business tools or answer in this stage.\n" if committing else
                  "DECIDE STAGE. Call decide_collaboration exactly once. Compare unchanged continuation with "
                  "a useful fixed-operation candidate; keep is fully valid. Only candidates list covered_work_ids. "
-                 "Snapshot/event identity is already bound by the runtime; do not echo hashes or event IDs. "
+                 "Snapshot, event and evidence identity are bound by the runtime; do not echo hashes or IDs. "
                  "If output_pressure exists, keep MUST provide recovery_step={goal,tool} for exactly one "
                  "already-loaded business tool, rather than retrying the entire task; defer is not a recovery. "
                  "Read the task and observations to identify new dependencies or independent goals; "
@@ -496,8 +496,6 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                 return
             if data['decision'] == 'candidate' and set(data['covered_work_ids']) != {u['work_id'] for u in state['work']}:
                 raise ValueError('candidate/keep must cover the same unfinished work IDs')
-            if any(e not in actor.evidence for e in data['evidence_ids']):
-                raise ValueError('decision evidence unavailable to this owner')
             choice = data['decision']
             if choice == 'candidate':
                 if 'recovery_step' in data:

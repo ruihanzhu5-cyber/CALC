@@ -19,7 +19,7 @@ def native(name, arguments, finish='tool_calls'):
 
 def keep(state, **changes):
     fields = {'decision': 'keep', 'reason': 'This work can continue without another loop',
-            'next_work': 'Current owner executes its next unresolved step', 'evidence_ids': [],
+            'next_work': 'Current owner executes its next unresolved step',
             **changes}
     if fields['decision'] == 'candidate' and 'covered_work_ids' not in fields:
         fields['covered_work_ids'] = [w['work_id'] for w in state['work']]
@@ -315,9 +315,35 @@ def test_snapshot_and_event_identity_are_bound_without_model_echo():
     main = rt._new('task', None, 'strong', [])
     state = snapshot(rt, main)
     data = {'decision': 'keep', 'reason': 'One dependent chain using existing source evidence',
-            'next_work': 'Main checks the next prerequisite', 'evidence_ids': []}
+            'next_work': 'Main checks the next prerequisite'}
     rt._accept_decision(main, native('decide_collaboration', data), None, state)
     assert main.status == 'ready' and not main.checkpoints
     recorded = next(e for e in rt.events if e['event'] == 'scheduling_result')
     assert recorded['snapshot_id'] == state['snapshot_id']
     assert recorded['covered_work_ids'] == ['scope:main']
+
+
+def test_decision_protocol_has_no_model_generated_evidence_identity():
+    rt = runtime()
+    parameters = rt.decide_tool['function']['parameters']
+    assert 'evidence_ids' not in parameters['properties']
+    assert parameters['additionalProperties'] is False
+    main = rt._new('task', None, 'strong', [])
+    state = snapshot(rt, main)
+    # This is the actual class of failed pilot response, not an ID to repair.
+    bad = keep(state, evidence_ids=[state['event_ids'][0]])
+    rt._accept_decision(main, native('decide_collaboration', bad), None, state)
+    assert main.status == 'failed'
+    assert any(e['event']=='scheduling_error' and 'Additional properties' in e['detail'] for e in rt.events)
+
+
+def test_candidate_binds_real_snapshot_evidence_without_echo_or_environment_call():
+    rt = runtime(tools=[function('read','read source',{},[])], invoke=lambda n,a:{'value':1})
+    main = rt._new('task',None,'strong',[])
+    rt._tool(main,'read',{})
+    state = snapshot(rt,main)
+    data = keep(state,decision='candidate',proposal=compact(pattern='parallel',branches=[{'goal':'inspect'}]))
+    assert 'evidence_ids' not in data
+    rt._accept_decision(main,native('decide_collaboration',data),None,state)
+    assert main.scheduling_candidate['proposal']['evidence_ids']==['e0']
+    assert len(rt.archive)==1 and set(rt.loops)=={'main'}

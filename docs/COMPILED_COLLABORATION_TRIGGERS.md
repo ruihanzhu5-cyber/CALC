@@ -32,7 +32,7 @@
 
 模型判断任务相关性、独立性、上下文专业化是否值回控制成本，以及采用 keep/sequence/parallel/fold/merge。独立核查 review_refine 仍可由模型基于证据提出，编译器不凭列表形状自动断言结论冲突。Main 和 Worker 都保留请求调整和递归分派。
 
-控制输入是职责、事件、来源和证据元数据的紧凑视图；工具参数移除常见认证字段，不重放全部求解历史。没有新加每步 LLM Judge。成本面板显示实际编译的下一次求解输入 UTF-8 字节及历史实测调用；不伪装成准确 Token 预测、剩余总费用、成功概率或已实现收益。
+控制输入是职责、事件、来源和证据元数据的紧凑视图；工具参数移除常见认证字段，不重放全部求解历史。调度响应不再回传 evidence_ids；运行时从通过版本检查的快照绑定真实证据。业务执行者的 report_progress/collaborate 证据接口仍保留。没有新加每步 LLM Judge。成本面板显示实际编译的下一次求解输入 UTF-8 字节及历史实测调用；不伪装成准确 Token 预测、剩余总费用、成功概率或已实现收益。
 
 ## 真正执行与上下文接管
 
@@ -63,7 +63,7 @@ CALC 单次 `max_output_tokens` 现在默认 None；请求不发送 max_tokens/m
 
 ## 验证与下一轮运行
 
-无付费回归：380 tests passed，Ruff passed。首次执行全套测试遗漏 PYTHONPATH 导致 CLI 子进程无法导入；补齐与正式运行一致的环境后全套通过，未为测试改 CLI 行为。
+首个冻结版本 2ed9ff9 的无付费回归：380 tests passed，Ruff passed。首次执行全套测试遗漏 PYTHONPATH 导致 CLI 子进程无法导入；补齐与正式运行一致的环境后全套通过，未为测试改 CLI 行为。随后三个真实调用暴露了事件/证据 ID 混淆，见 COMPILED_THREE_CASE_20261102.md；该缺陷已单独修复并新增回归，不把旧失败轨迹用修复版本解释。
 
 ```bash
 cd /mnt/d/CALC-experiments/code/CALC-task-progress
