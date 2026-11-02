@@ -28,8 +28,6 @@ def decision_tools(collaborate: dict) -> tuple[dict, dict]:
     proposal['properties']['operation']['enum'] = ['delegate', 'merge', 'fold', 'escalate', 'respond']
     proposal['required'] = ['operation', 'reason', 'proposed_next', 'expected_savings', 'risks', 'handoff']
     properties = {
-        'snapshot_id': {'type': 'string', 'minLength': 1},
-        'event_ids': {'type': 'array', 'items': {'type': 'string'}, 'uniqueItems': True},
         'decision': {'type': 'string', 'enum': ['keep', 'defer', 'candidate']},
         'reason': {'type': 'string', 'minLength': 1},
         'next_work': {'type': 'string', 'minLength': 1},
@@ -39,12 +37,11 @@ def decision_tools(collaborate: dict) -> tuple[dict, dict]:
         'proposal': proposal,
     }
     schema = {'type': 'object', 'properties': properties, 'additionalProperties': False,
-              'required': ['snapshot_id', 'event_ids', 'decision', 'reason', 'next_work',
-                           'evidence_ids', 'covered_work_ids'],
+              'required': ['decision', 'reason', 'next_work', 'evidence_ids'],
               'allOf': [
                   {'if': {'properties': {'decision': {'const': 'candidate'}}},
-                   'then': {'required': ['proposal'], 'not': {'required': ['dependencies']}},
-                   'else': {'not': {'required': ['proposal']}}},
+                   'then': {'required': ['proposal', 'covered_work_ids'], 'not': {'required': ['dependencies']}},
+                   'else': {'not': {'anyOf': [{'required': ['proposal']}, {'required': ['covered_work_ids']}]}}},
                   {'if': {'properties': {'decision': {'const': 'defer'}}},
                    'then': {'required': ['dependencies'],
                             'properties': {'dependencies': {'minItems': 1}}},
@@ -58,9 +55,8 @@ def decision_tools(collaborate: dict) -> tuple[dict, dict]:
         'description': 'After inspecting compiled input/transfer costs, commit the candidate or keep the original work. '
                        'Estimates are not measured savings or success probabilities.',
         'parameters': {'type': 'object', 'additionalProperties': False,
-            'properties': {'snapshot_id': {'type': 'string', 'minLength': 1},
-                           'commit': {'type': 'boolean'}, 'reason': {'type': 'string', 'minLength': 1}},
-            'required': ['snapshot_id', 'commit', 'reason']}}}
+            'properties': {'commit': {'type': 'boolean'}, 'reason': {'type': 'string', 'minLength': 1}},
+            'required': ['commit', 'reason']}}}
     return decide, confirm
 
 

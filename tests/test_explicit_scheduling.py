@@ -18,10 +18,12 @@ def native(name, arguments, finish='tool_calls'):
 
 
 def keep(state, **changes):
-    return {'snapshot_id': state['snapshot_id'], 'event_ids': state['event_ids'],
-            'decision': 'keep', 'reason': 'This work can continue without another loop',
+    fields = {'decision': 'keep', 'reason': 'This work can continue without another loop',
             'next_work': 'Current owner executes its next unresolved step', 'evidence_ids': [],
-            'covered_work_ids': [w['work_id'] for w in state['work']], **changes}
+            **changes}
+    if fields['decision'] == 'candidate' and 'covered_work_ids' not in fields:
+        fields['covered_work_ids'] = [w['work_id'] for w in state['work']]
+    return fields
 
 
 class Client:
@@ -38,8 +40,7 @@ class Client:
             state = json.loads(messages[-1]['content'].split('\n', 1)[1])
             return native(names[0], self.decide(state) if self.decide else keep(state))
         if names == ['commit_collaboration']:
-            data = json.loads(messages[-1]['content'].split('\n', 1)[1])
-            return native(names[0], {'snapshot_id': data['snapshot_id'], 'commit': self.commit,
+            return native(names[0], {'commit': self.commit,
                                      'reason': 'Compared the same work and actual context transfer'})
         return self.solve(messages)
 
@@ -64,7 +65,7 @@ def compact(operation='delegate', **fields):
 
 def stage(rt, actor, data):
     state = snapshot(rt, actor)
-    rt._accept_decision(actor, native('decide_collaboration', {**keep(state), **data}), None, state)
+    rt._accept_decision(actor, native('decide_collaboration', keep(state, **data)), None, state)
     return state
 
 
@@ -139,7 +140,7 @@ def test_candidate_preview_and_rejection_preserve_original_session():
     panel = main.scheduling_candidate['cost_panel']
     assert len(panel['candidate']['owners']) == 3  # waiting parent + two children
     assert panel['candidate']['remaining_wall_seconds'] is None
-    rt._accept_decision(main, native('commit_collaboration', {'snapshot_id': state['snapshot_id'],
+    rt._accept_decision(main, native('commit_collaboration', {
         'commit': False, 'reason': 'Handoff dominates'}), None, state)
     assert list(rt.loops) == ['main'] and main.status == 'ready'
     assert main.messages[0]['content'] == 'original'
@@ -200,7 +201,7 @@ def test_changed_owner_epoch_invalidates_candidate_without_transition():
     state = stage(rt, main, {'decision': 'candidate', 'proposal': compact(
         pattern='parallel', branches=[{'goal': 'A'}])})
     main.owner_epoch += 1
-    rt._accept_decision(main, native('commit_collaboration', {'snapshot_id': state['snapshot_id'],
+    rt._accept_decision(main, native('commit_collaboration', {
         'commit': True, 'reason': 'commit'}), None, state)
     assert list(rt.loops) == ['main']
     assert main.status == 'ready' and main.scheduling_candidate is None
@@ -216,7 +217,7 @@ def test_fold_preview_and_commit_use_real_capsule_and_complete_transferred_work(
         'fold', sources=[child.id], receiver=main.id)})
     assert child.status == 'ready'  # preview does not migrate the live owner
     assert [row['agent'] for row in main.scheduling_candidate['cost_panel']['candidate']['owners']] == ['main']
-    rt._accept_decision(main, native('commit_collaboration', {'snapshot_id': state['snapshot_id'],
+    rt._accept_decision(main, native('commit_collaboration', {
         'commit': True, 'reason': 'Parent can finish using shared evidence'}), None, state)
     assert child.status == 'folded' and child.transferred_to == main.id
     assert 'source history' in json.dumps(rt._tool(main, 'read_history', {'agent': child.id, 'offset': 0}))
@@ -294,7 +295,7 @@ def test_pending_child_request_can_be_rejected_inside_the_same_gateway():
     rt._deliver_notices(parent)
     state = stage(rt, parent, {'decision': 'candidate', 'proposal': compact('respond',
         request_id='r0', approve=False)})
-    rt._accept_decision(parent, native('commit_collaboration', {'snapshot_id': state['snapshot_id'],
+    rt._accept_decision(parent, native('commit_collaboration', {
         'commit': True, 'reason': 'Reject escalation, keep original session'}), None, state)
     assert child.status == 'ready' and rt.requests['r0']['status'] == 'decided'
     assert child.messages[0]['content'] == 'child'
@@ -306,3 +307,16 @@ def test_explicit_requires_events_and_has_no_hidden_limits():
         runtime(progress_checkpoints=False)
     rt = runtime()
     assert rt.max_waves is None
+
+
+def test_snapshot_and_event_identity_are_bound_without_model_echo():
+    rt = runtime()
+    main = rt._new('task', None, 'strong', [])
+    state = snapshot(rt, main)
+    data = {'decision': 'keep', 'reason': 'One dependent chain using existing source evidence',
+            'next_work': 'Main checks the next prerequisite', 'evidence_ids': []}
+    rt._accept_decision(main, native('decide_collaboration', data), None, state)
+    assert main.status == 'ready' and not main.checkpoints
+    recorded = next(e for e in rt.events if e['event'] == 'scheduling_result')
+    assert recorded['snapshot_id'] == state['snapshot_id']
+    assert recorded['covered_work_ids'] == ['scope:main']

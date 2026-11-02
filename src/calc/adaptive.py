@@ -330,7 +330,8 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                 ("COMMIT STAGE. Inspect the same-work cost panel. Call commit_collaboration exactly once; "
                  "commit=false resumes the original session. No business tools or answer.\n" if committing else
                  "DECIDE STAGE. Call decide_collaboration exactly once. Compare unchanged continuation with "
-                 "a useful fixed-operation candidate; keep is fully valid. Cover exactly all work_ids. "
+                 "a useful fixed-operation candidate; keep is fully valid. Only candidates list covered_work_ids. "
+                 "Snapshot/event identity is already bound by the runtime; do not echo hashes or event IDs. "
                  "Read the task and observations to identify new dependencies or independent goals; "
                  "a prior report_progress is NOT required. Preserve unfinished objectives and completion "
                  "conditions; role differences or collection size alone do not justify delegation. "
@@ -405,10 +406,10 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             if len(calls) != 1 or calls[0][1] != tool['function']['name']:
                 raise ValueError("one decision call and no business actions required")
             call, _, data = calls[0]
-            Draft202012Validator(tool['function']['parameters']).validate(data)
+            errors = list(Draft202012Validator(tool['function']['parameters']).iter_errors(data))
+            if errors:
+                raise ValueError('decision schema: ' + errors[0].message)
             assert_current(self, actor, state)
-            if data['snapshot_id'] != state['snapshot_id']:
-                raise ValueError("wrong snapshot_id")
             # Complete the real call protocol before a transition archives history.
             actor.messages.append(copy.deepcopy(response.message))
             actor.messages.append({'role': 'tool', 'tool_call_id': call['id'],
@@ -428,9 +429,7 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                           decision=selected, reason=data['reason'], outcome=outcome)
                 actor.messages.append({'role': 'user', 'content': 'Scheduling outcome: ' + json.dumps(outcome)})
                 return
-            if set(data['event_ids']) != set(state['event_ids']):
-                raise ValueError('decision must acknowledge exactly this event batch')
-            if set(data['covered_work_ids']) != {u['work_id'] for u in state['work']}:
+            if data['decision'] == 'candidate' and set(data['covered_work_ids']) != {u['work_id'] for u in state['work']}:
                 raise ValueError('candidate/keep must cover the same unfinished work IDs')
             if any(e not in actor.evidence for e in data['evidence_ids']):
                 raise ValueError('decision evidence unavailable to this owner')
@@ -469,7 +468,7 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             self.emit('scheduling_result', agent=actor.id, snapshot_id=state['snapshot_id'],
                       decision=choice, reason=data['reason'], next_work=data['next_work'],
                       next_executors=data.get('dependencies', [actor.id]),
-                      covered_work_ids=data['covered_work_ids'])
+                      covered_work_ids=[u['work_id'] for u in state['work']])
         except StaleDecisionError:
             actor.scheduling_candidate = None
             self.emit('scheduling_invalidated', agent=actor.id, snapshot_id=state['snapshot_id'],

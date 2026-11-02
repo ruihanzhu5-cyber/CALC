@@ -6,7 +6,7 @@
 
 `AdaptiveRuntime(scheduling="explicit")` 在首次任务理解、首次环境观察、新业务集合、完成/失败、阻塞、依赖、跨执行者重复资源等新事件边界进入明确 DECIDE。普通工具结果继续当前 loop；同批事件合并，事件版本未变化不重复调度。首次观察只提供比较机会，不决定操作。
 
-DECIDE 只提供 `decide_collaboration`，没有业务工具。模型必须以一个原生工具调用返回 keep/defer/candidate，覆盖相同未完职责 ID、证据引用、具体下一步和理由；不存在默认 keep。模型可以读取本来就能看到的任务和历史后提出分工，不要求预先调用 report_progress。
+DECIDE 只提供 `decide_collaboration`，没有业务工具。模型必须以一个原生工具调用返回 keep/defer/candidate、证据引用、具体下一步和理由；候选另列相同未完职责 ID。snapshot/event 标识由发起请求的运行时绑定和验证，不要求模型回传哈希或事件 ID；keep 的原职责也由真实状态保留。不存在默认 keep。模型可以读取本来就能看到的任务和历史后提出分工，不要求预先调用 report_progress。
 
 keep 结束该事件批，原会话继续。defer 绑定活跃直接子职责，完成/失败等状态变化可唤醒；普通工具引起的子版本增长不唤醒父节点。等待审批的子职责不能作为 defer 对象。
 
@@ -64,3 +64,5 @@ WorkBench 预检不加 execute；AppWorld 先 lock-data，预检不加 execute�
 ```
 
 本轮授权只运行历史 WorkBench multi_domain_0 和 AppWorld train 82e2fac_1，均 Flash4096、原 concurrency 和环境参数。新目录/官方实验命名隔离，不覆盖旧答案或判分。逐题比较官方成功、正常完成、输入输出 Token、控制与执行请求、runtime 墙钟及切换。单次开发案例对比不作为平均性能或 SOTA 结论。
+
+首次 a1a45cc WorkBench 尝试因模型输出缺失冗余 snapshot_id 而严格拒绝，未交卷；其轨迹和消费保留，不能当正常题目结果或省 Token 收益。后续协议修订删除模型的身份回传义务，运行时继续对真实请求快照检查版本；没有补字段、接纳旧坏响应或自动把错误改为 keep。本轮运行两题的授权范围内只修复并补跑 WorkBench，保留已正常完成的 AppWorld，不扩展任务集合；两题应分别注明实际代码版本和条件恢复性质。
