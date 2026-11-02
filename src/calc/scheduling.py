@@ -117,7 +117,26 @@ def scoped_decision_tool(runtime, actor, state: dict) -> dict:
     proposal = properties['proposal']['properties']
     names(proposal['sources'], runtime.loops)
     proposal['receiver']['enum'] = list(runtime.loops)
+    if (runtime.collaboration_requirement == 'required_parallel' and actor.id == 'main'
+            and not runtime.collaboration_receipts()):
+        constrain_parallel_proposal(properties['proposal'], actor)
+    if runtime._requires_expansion(actor):
+        properties['decision']['enum'] = ['candidate']
+        tool['function']['description'] = 'Required-parallel experiment: propose a real parallel work plan. Keep is disabled.'
     return tool
+
+
+def constrain_parallel_proposal(proposal: dict, actor) -> None:
+    """An explicit experimental requirement, never a claim of learned utility."""
+    properties = proposal['properties']
+    properties['operation']['enum'] = ['delegate']
+    properties['pattern']['enum'] = ['parallel']
+    properties['branches']['minItems'] = 2
+    proposal['required'] = list(dict.fromkeys([*proposal['required'], 'pattern', 'branches']))
+    if len(actor.read_sources) >= 2:
+        branch = properties['branches']['items']
+        branch['properties']['read_only']['const'] = True
+        branch['required'] = list(dict.fromkeys([*branch.get('required', []), 'read_only']))
 
 
 def scoped_revision_tool(runtime, actor, state: dict) -> dict:
@@ -171,6 +190,8 @@ def snapshot(runtime, actor) -> dict:
                                                         runtime.initial_open, actor.parent is None)),
         'suggestion': copy.deepcopy(actor.scheduling_suggestion),
         'world_version': runtime.world_version,
+        'collaboration_requirement': runtime.collaboration_requirement,
+        'collaboration_gate_active': runtime.collaboration_gate_active,
         'output_pressure': copy.deepcopy(actor.output_pressure),
     }
     state['snapshot_id'] = fingerprint(state)

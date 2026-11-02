@@ -16,7 +16,9 @@ SECTIONS = {
     'progress.py': ['WorkReport'],
     'triggers.py': ['compile_candidate'],
     'scheduling.py': ['scoped_revision_tool', 'continuation_panel'],
-    'adaptive.py': ['AdaptiveRuntime._compile_opportunity', 'AdaptiveRuntime._accept_decision',
+    'adaptive.py': ['AdaptiveRuntime.collaboration_receipts', 'AdaptiveRuntime._requires_expansion',
+                    'AdaptiveRuntime._validate_required_plan',
+                    'AdaptiveRuntime._compile_opportunity', 'AdaptiveRuntime._accept_decision',
                     'AdaptiveRuntime.change', 'AdaptiveRuntime._apply_change', 'AdaptiveRuntime._accept'],
 }
 

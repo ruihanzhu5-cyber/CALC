@@ -16,7 +16,8 @@ from test_explicit_scheduling import Client, native, keep, compact, answer
 
 @pytest.mark.skipif(not os.environ.get('CALC_APPWORLD_LIVE_CONFIG'), reason='Official D-backed environment opt-in')
 @pytest.mark.parametrize('organization', ['proposal', 'revision'])
-def test_official_shared_world_rejection_delegate_worker_tools_and_return(tmp_path, organization):
+@pytest.mark.parametrize('requirement', ['none', 'required_parallel'])
+def test_official_shared_world_rejection_delegate_worker_tools_and_return(tmp_path, organization, requirement):
     cfg=json.loads(Path(os.environ['CALC_APPWORLD_LIVE_CONFIG']).read_text())
     for key,value in cfg['storage'].items():
         os.environ[key]=value
@@ -42,6 +43,8 @@ def test_official_shared_world_rejection_delegate_worker_tools_and_return(tmp_pa
         actor=messages[0]['content'].split('You are ')[1].split('.')[0]
         if actor not in executed:
             executed.add(actor)
+            if actor != 'main' and requirement == 'required_parallel':
+                return native('appworld_api', {'app':'supervisor','api':'show_profile','arguments':{}})
             return native('appworld_api',{'app':'api_docs','api':'show_app_descriptions','arguments':{}})
         return answer('Integration path finished; not a benchmark task solution')
     class IntegrationClient(Client):
@@ -74,12 +77,14 @@ def test_official_shared_world_rejection_delegate_worker_tools_and_return(tmp_pa
                 trace.write(json.dumps(event,default=str)+'\n')
                 trace.flush()
             runtime=adaptive_runtime(session.actor_environment(),strong=client,weak=client,event_sink=emit,
-                options={'scheduling':'explicit','compiled_triggers':True,'concurrency':3})
+                options={'scheduling':'explicit','compiled_triggers':True,'concurrency':3,
+                         'collaboration_requirement':requirement})
             result=runtime.run('Integration only: read public documentation and return; do not solve or score a task')
         assert result['status']=='answered' and len(runtime.loops)==3
         assert result['metrics']['scheduling_rejections']==1
         assert result['metrics']['scheduling_errors']==0 and result['metrics']['switches']==1
         assert result['metrics']['collaboration_revisions'] == (organization == 'revision')
+        assert bool(result['collaboration_receipts']) == (requirement == 'required_parallel')
         assert adapter.tool_calls==3 and session.phase=='execute'
         assert executed=={'main','agent_1','agent_2'}
         assert {e['agent'] for e in result['events'] if e['event']=='tool_result'}==executed

@@ -123,7 +123,9 @@ class AppWorldAdapter:
                       if k not in {'page_index', 'page_limit'}}
         family = hashlib.sha256(json.dumps([app, api, parameters], sort_keys=True).encode()).hexdigest()
         return {'effect': 'read' if method in {'GET', 'HEAD'} else 'write',
-                'family': family, 'label': f'{app}.{api}'}
+                'family': family, 'label': f'{app}.{api}',
+                'category': 'capability' if app == 'api_docs' or api == 'login' or
+                    (app == 'supervisor' and api == 'show_account_passwords') else 'task'}
 
     def evaluate(self) -> dict:
         if self.phase != "evaluation":

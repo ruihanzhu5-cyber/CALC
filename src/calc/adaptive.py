@@ -195,6 +195,8 @@ class Loop:
     output_pressure: dict | None = None
     pressure_seen: list[str] = field(default_factory=list)
     recovery_step: dict | None = None
+    assignment_group: str | None = None
+    assignment_pattern: str | None = None
 
 
 class AdaptiveRuntime:
@@ -208,6 +210,7 @@ class AdaptiveRuntime:
                  progress_checkpoints: bool = True,
                  scheduling: str = "voluntary",
                  compiled_triggers: bool = False,
+                 collaboration_requirement: str = 'none',
                  output_pressure_review: bool = False,
                  tool_traits: Callable[[str, dict], dict] | None = None,
                  tool_loading: str = "all",
@@ -239,6 +242,13 @@ class AdaptiveRuntime:
         if compiled_triggers and scheduling != 'explicit':
             raise ValueError('compiled triggers require explicit scheduling')
         self.compiled_triggers = compiled_triggers
+        if collaboration_requirement not in {'none', 'required_parallel'}:
+            raise ValueError('collaboration_requirement must be none or required_parallel')
+        if collaboration_requirement != 'none' and (
+                not compiled_triggers or concurrency < 2 or collaboration_mode not in {'full', 'no_merge_fold'}):
+            raise ValueError('required_parallel needs compiled scheduling, concurrency >= 2 and a dynamic operation mode')
+        self.collaboration_requirement = collaboration_requirement
+        self.collaboration_gate_active = False
         if output_pressure_review and not compiled_triggers:
             raise ValueError('output pressure review requires compiled triggers')
         self.output_pressure_review = output_pressure_review
@@ -330,6 +340,14 @@ is a suggestion for the same explicit decision stage, not a second direct transi
 Do not report or delegate just to demonstrate activity. New observations can justify keeping the team.
 """
         system = policy + "\n" + self.environment_context
+        if self.collaboration_requirement != 'none':
+            system += ('\nExplicit experiment profile: required_parallel. After a compiled work frontier, '
+                'Main must delegate at least two task responsibilities in parallel. Worker task-tool '
+                'evidence and nonempty completed results must reach Main before final submission. '
+                'Reading documentation or merely saying a worker is done does not satisfy this requirement. '
+                'This is a required-collaboration experiment, not an autonomous keep/switch result. '
+                'Workers use shared_context_index/read_evidence for relevant setup/docs instead of replaying '
+                'the full parent history. Root owns integration and final submission.')
         system += f"\nYou are {actor.id}. Parent: {actor.parent}. Skills: {json.dumps(catalog)}"
         system += "\nCurrent team state: " + self._state(actor)
         system += "\nAllowed collaboration operations: " + json.dumps(sorted(
@@ -353,6 +371,41 @@ Do not report or delegate just to demonstrate activity. New observations can jus
         return [REPORT_PROGRESS, COLLABORATE, LOAD_SKILL, READ_EVIDENCE, READ_HISTORY, COMPLETE_WORK,
                 *([DISCOVER_TOOLS, LOAD_TOOLS] if self.tool_loading == "deferred" else [])]
 
+    def collaboration_receipts(self) -> list[dict]:
+        """Execution facts, not agent claims or calibrated contribution scores."""
+        groups = {}
+        for loop in self.loops.values():
+            if loop.parent == 'main' and loop.assignment_group and loop.assignment_pattern == 'parallel':
+                groups.setdefault(loop.assignment_group, []).append(loop)
+        parent = self.loops.get('main')
+        receipts = []
+        for group, children in groups.items():
+            deliveries = []
+            for child in children:
+                evidence = [eid for eid, record in self.archive.items() if record['agent'] == child.id and
+                            record.get('traits', {}).get('category', 'task') == 'task']
+                if (self._satisfied(child.id) and child.answer.strip() and evidence and
+                        parent is not None and set(evidence) <= set(parent.evidence)):
+                    deliveries.append({'agent': child.id, 'evidence_ids': evidence, 'result': child.answer})
+            if len(deliveries) >= 2 and all(self._satisfied(child.id) for child in children):
+                receipts.append({'group': group, 'pattern': 'parallel', 'deliveries': deliveries})
+        return receipts
+
+    def _requires_expansion(self, actor: Loop) -> bool:
+        return (self.collaboration_requirement == 'required_parallel' and self.collaboration_gate_active and
+                actor.id == 'main' and not self.collaboration_receipts() and not self._live_children(actor.id))
+
+    def _validate_required_plan(self, actor: Loop, proposal: dict) -> None:
+        pending_root_plan = (self.collaboration_requirement == 'required_parallel' and actor.id == 'main'
+                             and not self.collaboration_receipts() and proposal.get('operation') == 'delegate')
+        if (self._requires_expansion(actor) or pending_root_plan) and (
+                proposal.get('operation') != 'delegate' or proposal.get('pattern') != 'parallel' or
+                len(proposal.get('branches', [])) < 2):
+            raise ValueError('required_parallel profile requires a parallel work plan with at least two branches')
+        if (self._requires_expansion(actor) and len(actor.read_sources) >= 2 and
+                any(branch.get('read_only') is not True for branch in proposal.get('branches', []))):
+            raise ValueError('compiled read-frontier delegation requires explicitly read-only workers')
+
     def _commit_schema(self, actor: Loop) -> dict:
         item = actor.scheduling_candidate
         tool = copy.deepcopy(self.commit_tool)
@@ -362,6 +415,11 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             params['properties']['selection'] = {'type': 'string', 'enum':
                 ['keep', *[a['id'] for a in item['alternatives']]]}
             params['required'] = ['selection', 'reason']
+            if self._requires_expansion(actor):
+                params['properties']['selection']['enum'] = [a['id'] for a in item['alternatives']
+                    if a['proposal']['operation'] == 'delegate' and a['proposal'].get('pattern') == 'parallel']
+        elif self._requires_expansion(actor):
+            tool['function']['parameters']['properties']['commit']['const'] = True
         return tool
 
     def _scheduling_tools(self, actor: Loop, state: dict) -> list[dict]:
@@ -380,8 +438,12 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             committing = actor.scheduling_candidate is not None
             tools = self._scheduling_tools(actor, scheduling_state)
             body = actor.scheduling_candidate if committing else scheduling_state
+            requirement = ('REQUIRED_PARALLEL PROFILE: keep is disabled at this frontier. Choose a parallel plan '
+                'or revise it into at least two real remaining task scopes. Skip completed scopes. '
+                'Read-frontier workers must be read_only=true; Main retains final writes. '
+                if self._requires_expansion(actor) else '')
             messages.append({"role": "user", "content":
-                ("COMMIT STAGE. Inspect all same-work alternatives and their compiled costs. "
+                requirement + ("COMMIT STAGE. Inspect all same-work alternatives and their compiled costs. "
                  "Use exactly ONE control call: commit_collaboration to keep/select the suggested plan, OR "
                  "revise_collaboration to execute a better task-grounded operation. "
                  "Suggested source families are not mandatory work boundaries: change branch goals/count, "
@@ -638,6 +700,13 @@ Do not report or delegate just to demonstrate activity. New observations can jus
         item = compile_candidate(self, actor, state)
         if item is None:
             return False
+        if (self.collaboration_requirement == 'required_parallel' and actor.id == 'main' and
+                item['proposal']['operation'] == 'delegate' and not self.collaboration_gate_active):
+            self.collaboration_gate_active = True
+            state.clear()
+            state.update(snapshot(self, actor))
+            self.emit('collaboration_gate_activated', agent=actor.id,
+                      requirement=self.collaboration_requirement, trigger_kind=item['kind'])
         actor.compiled_triggers.append(item['signature'])
         self.emit('trigger_fired', agent=actor.id, trigger_kind=item['kind'], facts=item['facts'],
                   signature=item['signature'], action='candidate comparison required, not automatic commit')
@@ -793,6 +862,7 @@ Do not report or delegate just to demonstrate activity. New observations can jus
     def change(self, actor_id: str, p: dict) -> dict:
         actor = self.loops[actor_id]
         p = self._expand_proposal(actor, p)
+        self._validate_required_plan(actor, p)
         operation = p.get("operation")
         self.emit("collaboration_request", actor=actor_id, proposal=p)
         if operation not in allowed_operations(self.collaboration_mode, self.initial_open, actor.parent is None):
@@ -870,6 +940,7 @@ Do not report or delegate just to demonstrate activity. New observations can jus
     def _apply_change(self, actor_id: str, p: dict) -> dict:
         """Validate the full transition before mutations; called only at a wave barrier."""
         actor = self.loops[actor_id]
+        self._validate_required_plan(actor, p)
         operation = p.get("operation")
         if actor.status not in {"ready", "waiting"}:
             raise ValueError("actor no longer live")
@@ -917,9 +988,13 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             history_ref = f"{actor.id}@{actor.version}"
             for b in branches:
                 child = self._new(b["goal"], actor.id, "weak", b.get("skills", []))
+                child.assignment_group = history_ref
+                child.assignment_pattern = pattern
                 child.read_only = actor.read_only or b.get('read_only', False)
                 child.source_family = b.get('source_family')
-                child.evidence = list(b.get("evidence_ids", evidence_ids))
+                shared = [eid for eid in actor.evidence
+                          if self.archive[eid].get('traits', {}).get('category') == 'capability']
+                child.evidence = list(dict.fromkeys([*b.get("evidence_ids", evidence_ids), *shared]))
                 child.allowed_tools = list(b.get("tools", actor.allowed_tools))
                 child.loaded_tools = list(child.allowed_tools) if self.tool_loading == "all" else []
                 child.history_refs = [history_ref, actor.id]
@@ -933,6 +1008,9 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                     "parent_progress": copy.deepcopy(p.get("progress", asdict(actor.work))),
                     "evidence_ids": child.evidence, "history_ref": history_ref,
                     "history_access": "immutable snapshot at delegation; use read_history",
+                    "shared_context_index": [{'evidence_id': eid,
+                        'operation': self.archive[eid]['traits']['label'],
+                        'arguments': self.archive[eid]['arguments']} for eid in shared],
                     "tools": child.allowed_tools, "read_only": child.read_only,
                     "source_family": child.source_family}
                 child.messages.append({"role": "user", "content":
@@ -1088,6 +1166,14 @@ Do not report or delegate just to demonstrate activity. New observations can jus
         traits = describe_tool(self, name, args)
         if actor.read_only and traits['effect'] != 'read':
             raise PermissionError('read-only responsibility cannot invoke write or unknown effects')
+        if self.collaboration_requirement != 'none':
+            receipts = self.collaboration_receipts()
+            if self.is_final_submission and self.is_final_submission(name, args) and (
+                    actor.id != 'main' or not receipts):
+                raise PermissionError('required_parallel: only Main may submit after real worker task deliveries')
+            if (actor.id == 'main' and self.collaboration_gate_active and not receipts and
+                    traits.get('category', 'task') == 'task'):
+                raise PermissionError('required_parallel: delegate task work; Main may only prepare capabilities until workers deliver')
         pending_readers = [a for a in self.loops.values() if a.read_only and not self._satisfied(a.id) and
                            (a.parent == actor.id or a.transferred_to == actor.id)]
         if pending_readers and traits['effect'] != 'read':
@@ -1309,6 +1395,11 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             actor.messages.append({"role": "user", "content":
                 "Unresolved responsibilities remain; finish or take over them before answering: " + json.dumps(unresolved)})
             return
+        if actor.id == 'main' and self.collaboration_requirement != 'none' and not self.collaboration_receipts():
+            actor.status = 'failed'
+            self.emit('collaboration_requirement_failed', agent=actor.id,
+                      requirement=self.collaboration_requirement, reason='No real parallel worker task deliveries')
+            return
         actor.answer, actor.status = text, "done"
         actor.work.progress = "Local answer submitted; benchmark correctness not evaluated"
         actor.work.next_step = "Return result to parent" if actor.parent else "Execution finished"
@@ -1421,6 +1512,8 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                 "evidence": self.archive, "correctness": "not_evaluated",
                 "collaboration_mode": self.collaboration_mode,
                 "scheduling": self.scheduling,
+                "collaboration_requirement": self.collaboration_requirement,
+                "collaboration_receipts": self.collaboration_receipts(),
                 "resource_limits": {'max_output_tokens': self.max_output_tokens,
                     'max_case_tokens': self.max_case_tokens, 'max_case_requests': self.max_case_requests,
                     'token_budget_enforcement': 'stop new calls after returned usage; an in-flight wave can overshoot',

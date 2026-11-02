@@ -35,8 +35,8 @@ class WorkReport:
         return cls(**value)
 
 
-# SOURCE src/calc/triggers.py:53  compile_candidate
-# SHA256 4f8f734f5e400ff7a42add1c3ccf4e978839a3af7fe1f42a5aa113d2b88d8384
+# SOURCE src/calc/triggers.py:56  compile_candidate
+# SHA256 bb49863ae9ffa672020429c39d41279d666331adbdb4c41c64de8be0d5849b83
 def compile_candidate(runtime, actor, state: dict) -> dict | None:
     allowed = allowed_operations(runtime.collaboration_mode, runtime.initial_open, actor.parent is None)
     # Whole-loop transfer only. A factual overlap or output exhaustion opens a
@@ -136,8 +136,8 @@ def compile_candidate(runtime, actor, state: dict) -> dict | None:
                                              {'id': 'sequence', 'proposal': sequential}]}
 
 
-# SOURCE src/calc/scheduling.py:123  scoped_revision_tool
-# SHA256 5b3a3ffa22f6f23272cb6d2ea15705496476f3ca0232a875d60d29df955b38cb
+# SOURCE src/calc/scheduling.py:142  scoped_revision_tool
+# SHA256 339d449fcf36385a84d5281c7a366c416ac204e2cd2d06a2d2dc01235f296512
 def scoped_revision_tool(runtime, actor, state: dict) -> dict:
     """One alternative to accepting a compiled plan, not another approval round.
 
@@ -160,8 +160,8 @@ def scoped_revision_tool(runtime, actor, state: dict) -> dict:
             'required': ['reason', 'next_work', 'proposal']}}}
 
 
-# SOURCE src/calc/scheduling.py:234  continuation_panel
-# SHA256 5b3a3ffa22f6f23272cb6d2ea15705496476f3ca0232a875d60d29df955b38cb
+# SOURCE src/calc/scheduling.py:255  continuation_panel
+# SHA256 339d449fcf36385a84d5281c7a366c416ac204e2cd2d06a2d2dc01235f296512
 def continuation_panel(runtime, shadow, state: dict, keep: dict, candidate: dict) -> dict:
     """Expose residual work and an unevaluated cost expression, not a forecast.
 
@@ -206,12 +206,63 @@ def continuation_panel(runtime, shadow, state: dict, keep: dict, candidate: dict
     return result
 
 
-# SOURCE src/calc/adaptive.py:637  AdaptiveRuntime._compile_opportunity
-# SHA256 3c4005bd641a70a450b4b956d0357a6edb222b767da552ba5ccaa42ed573fdf7
+# SOURCE src/calc/adaptive.py:374  AdaptiveRuntime.collaboration_receipts
+# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
+def collaboration_receipts(self) -> list[dict]:
+    """Execution facts, not agent claims or calibrated contribution scores."""
+    groups = {}
+    for loop in self.loops.values():
+        if loop.parent == 'main' and loop.assignment_group and loop.assignment_pattern == 'parallel':
+            groups.setdefault(loop.assignment_group, []).append(loop)
+    parent = self.loops.get('main')
+    receipts = []
+    for group, children in groups.items():
+        deliveries = []
+        for child in children:
+            evidence = [eid for eid, record in self.archive.items() if record['agent'] == child.id and
+                        record.get('traits', {}).get('category', 'task') == 'task']
+            if (self._satisfied(child.id) and child.answer.strip() and evidence and
+                    parent is not None and set(evidence) <= set(parent.evidence)):
+                deliveries.append({'agent': child.id, 'evidence_ids': evidence, 'result': child.answer})
+        if len(deliveries) >= 2 and all(self._satisfied(child.id) for child in children):
+            receipts.append({'group': group, 'pattern': 'parallel', 'deliveries': deliveries})
+    return receipts
+
+
+# SOURCE src/calc/adaptive.py:394  AdaptiveRuntime._requires_expansion
+# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
+def _requires_expansion(self, actor: Loop) -> bool:
+    return (self.collaboration_requirement == 'required_parallel' and self.collaboration_gate_active and
+            actor.id == 'main' and not self.collaboration_receipts() and not self._live_children(actor.id))
+
+
+# SOURCE src/calc/adaptive.py:398  AdaptiveRuntime._validate_required_plan
+# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
+def _validate_required_plan(self, actor: Loop, proposal: dict) -> None:
+    pending_root_plan = (self.collaboration_requirement == 'required_parallel' and actor.id == 'main'
+                         and not self.collaboration_receipts() and proposal.get('operation') == 'delegate')
+    if (self._requires_expansion(actor) or pending_root_plan) and (
+            proposal.get('operation') != 'delegate' or proposal.get('pattern') != 'parallel' or
+            len(proposal.get('branches', [])) < 2):
+        raise ValueError('required_parallel profile requires a parallel work plan with at least two branches')
+    if (self._requires_expansion(actor) and len(actor.read_sources) >= 2 and
+            any(branch.get('read_only') is not True for branch in proposal.get('branches', []))):
+        raise ValueError('compiled read-frontier delegation requires explicitly read-only workers')
+
+
+# SOURCE src/calc/adaptive.py:699  AdaptiveRuntime._compile_opportunity
+# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
 def _compile_opportunity(self, actor: Loop, state: dict) -> bool:
     item = compile_candidate(self, actor, state)
     if item is None:
         return False
+    if (self.collaboration_requirement == 'required_parallel' and actor.id == 'main' and
+            item['proposal']['operation'] == 'delegate' and not self.collaboration_gate_active):
+        self.collaboration_gate_active = True
+        state.clear()
+        state.update(snapshot(self, actor))
+        self.emit('collaboration_gate_activated', agent=actor.id,
+                  requirement=self.collaboration_requirement, trigger_kind=item['kind'])
     actor.compiled_triggers.append(item['signature'])
     self.emit('trigger_fired', agent=actor.id, trigger_kind=item['kind'], facts=item['facts'],
               signature=item['signature'], action='candidate comparison required, not automatic commit')
@@ -238,8 +289,8 @@ def _compile_opportunity(self, actor: Loop, state: dict) -> bool:
     return True
 
 
-# SOURCE src/calc/adaptive.py:460  AdaptiveRuntime._accept_decision
-# SHA256 3c4005bd641a70a450b4b956d0357a6edb222b767da552ba5ccaa42ed573fdf7
+# SOURCE src/calc/adaptive.py:522  AdaptiveRuntime._accept_decision
+# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
 def _accept_decision(self, actor: Loop, response: Any, error: str | None, state: dict) -> None:
     """One explicit control stage; no business actions or implicit JSON repair."""
     committing = actor.scheduling_candidate is not None
@@ -398,11 +449,12 @@ def _accept_decision(self, actor: Loop, response: Any, error: str | None, state:
         self._notice(actor.parent, 'failed', actor, {'reason': 'scheduling_error', 'work': asdict(actor.work)})
 
 
-# SOURCE src/calc/adaptive.py:793  AdaptiveRuntime.change
-# SHA256 3c4005bd641a70a450b4b956d0357a6edb222b767da552ba5ccaa42ed573fdf7
+# SOURCE src/calc/adaptive.py:862  AdaptiveRuntime.change
+# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
 def change(self, actor_id: str, p: dict) -> dict:
     actor = self.loops[actor_id]
     p = self._expand_proposal(actor, p)
+    self._validate_required_plan(actor, p)
     operation = p.get("operation")
     self.emit("collaboration_request", actor=actor_id, proposal=p)
     if operation not in allowed_operations(self.collaboration_mode, self.initial_open, actor.parent is None):
@@ -454,11 +506,12 @@ def change(self, actor_id: str, p: dict) -> dict:
     return outcome
 
 
-# SOURCE src/calc/adaptive.py:870  AdaptiveRuntime._apply_change
-# SHA256 3c4005bd641a70a450b4b956d0357a6edb222b767da552ba5ccaa42ed573fdf7
+# SOURCE src/calc/adaptive.py:940  AdaptiveRuntime._apply_change
+# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
 def _apply_change(self, actor_id: str, p: dict) -> dict:
     """Validate the full transition before mutations; called only at a wave barrier."""
     actor = self.loops[actor_id]
+    self._validate_required_plan(actor, p)
     operation = p.get("operation")
     if actor.status not in {"ready", "waiting"}:
         raise ValueError("actor no longer live")
@@ -506,9 +559,13 @@ def _apply_change(self, actor_id: str, p: dict) -> dict:
         history_ref = f"{actor.id}@{actor.version}"
         for b in branches:
             child = self._new(b["goal"], actor.id, "weak", b.get("skills", []))
+            child.assignment_group = history_ref
+            child.assignment_pattern = pattern
             child.read_only = actor.read_only or b.get('read_only', False)
             child.source_family = b.get('source_family')
-            child.evidence = list(b.get("evidence_ids", evidence_ids))
+            shared = [eid for eid in actor.evidence
+                      if self.archive[eid].get('traits', {}).get('category') == 'capability']
+            child.evidence = list(dict.fromkeys([*b.get("evidence_ids", evidence_ids), *shared]))
             child.allowed_tools = list(b.get("tools", actor.allowed_tools))
             child.loaded_tools = list(child.allowed_tools) if self.tool_loading == "all" else []
             child.history_refs = [history_ref, actor.id]
@@ -522,6 +579,9 @@ def _apply_change(self, actor_id: str, p: dict) -> dict:
                 "parent_progress": copy.deepcopy(p.get("progress", asdict(actor.work))),
                 "evidence_ids": child.evidence, "history_ref": history_ref,
                 "history_access": "immutable snapshot at delegation; use read_history",
+                "shared_context_index": [{'evidence_id': eid,
+                    'operation': self.archive[eid]['traits']['label'],
+                    'arguments': self.archive[eid]['arguments']} for eid in shared],
                 "tools": child.allowed_tools, "read_only": child.read_only,
                 "source_family": child.source_family}
             child.messages.append({"role": "user", "content":
@@ -617,8 +677,8 @@ def _apply_change(self, actor_id: str, p: dict) -> dict:
     return {"operation": operation, "receiver": receiver_id, "sources": source_ids}
 
 
-# SOURCE src/calc/adaptive.py:1167  AdaptiveRuntime._accept
-# SHA256 3c4005bd641a70a450b4b956d0357a6edb222b767da552ba5ccaa42ed573fdf7
+# SOURCE src/calc/adaptive.py:1253  AdaptiveRuntime._accept
+# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
 def _accept(self, actor: Loop, response: Any, error: str | None, pending: list,
             required_checkpoints: list[str] | None = None, request_version: int | None = None,
             request_epoch: int | None = None) -> None:
