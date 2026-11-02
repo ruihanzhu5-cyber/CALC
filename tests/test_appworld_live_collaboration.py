@@ -15,7 +15,8 @@ from test_explicit_scheduling import Client, native, keep, compact, answer
 
 
 @pytest.mark.skipif(not os.environ.get('CALC_APPWORLD_LIVE_CONFIG'), reason='Official D-backed environment opt-in')
-def test_official_shared_world_rejection_delegate_worker_tools_and_return(tmp_path):
+@pytest.mark.parametrize('organization', ['proposal', 'revision'])
+def test_official_shared_world_rejection_delegate_worker_tools_and_return(tmp_path, organization):
     cfg=json.loads(Path(os.environ['CALC_APPWORLD_LIVE_CONFIG']).read_text())
     for key,value in cfg['storage'].items():
         os.environ[key]=value
@@ -54,6 +55,17 @@ def test_official_shared_world_rejection_delegate_worker_tools_and_return(tmp_pa
                     return native('commit_collaboration',{'selection':'keep','reason':'This integration checks delegation only'})
                 if body['proposal']['operation']!='delegate':
                     return native('commit_collaboration',{'commit':False,'reason':'This integration checks delegation only'})
+                if organization == 'revision':
+                    return native('revise_collaboration', {
+                        'reason': 'Separate the two documentation checks and retain parent integration',
+                        'next_work': 'Both workers read official docs, then parent resumes',
+                        'proposal': {'operation': 'delegate', 'pattern': 'parallel',
+                            'expected_savings': 'Integration fixture: no empirical efficiency claim',
+                            'risks': 'These documentation reads can overlap',
+                            'handoff': 'Preserve current task and access original history',
+                            'branches': [
+                                {'goal': 'Read app descriptions', 'tools': ['appworld_api'], 'read_only': True},
+                                {'goal': 'Independently check descriptions', 'tools': ['appworld_api'], 'read_only': True}]}})
             return super().complete(messages,**kw)
     client=IntegrationClient(solve,decide)
     try:
@@ -67,6 +79,7 @@ def test_official_shared_world_rejection_delegate_worker_tools_and_return(tmp_pa
         assert result['status']=='answered' and len(runtime.loops)==3
         assert result['metrics']['scheduling_rejections']==1
         assert result['metrics']['scheduling_errors']==0 and result['metrics']['switches']==1
+        assert result['metrics']['collaboration_revisions'] == (organization == 'revision')
         assert adapter.tool_calls==3 and session.phase=='execute'
         assert executed=={'main','agent_1','agent_2'}
         assert {e['agent'] for e in result['events'] if e['event']=='tool_result'}==executed

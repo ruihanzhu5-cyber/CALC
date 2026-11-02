@@ -41,7 +41,7 @@ class Client:
         if names == ['decide_collaboration']:
             state = json.loads(messages[-1]['content'].split('\n', 1)[1])
             return native(names[0], self.decide(state) if self.decide else keep(state))
-        if names == ['commit_collaboration']:
+        if 'commit_collaboration' in names:
             fields = kw['tools'][0]['function']['parameters']['properties']
             choice = {'selection': 'parallel' if self.commit else 'keep'} if 'selection' in fields else {'commit': self.commit}
             return native(names[0], {**choice, 'reason': 'Compared the same work and actual context transfer'})

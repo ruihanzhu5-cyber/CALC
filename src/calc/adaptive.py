@@ -19,7 +19,7 @@ from jsonschema import Draft202012Validator
 from calc.llm import aggregate_usage
 from calc.capabilities import ToolRegistry
 from calc.protocol import parse_tool_calls, error_messages
-from calc.scheduling import (decision_tools, scoped_decision_tool, snapshot, assert_current, normalize_candidate,
+from calc.scheduling import (decision_tools, scoped_decision_tool, scoped_revision_tool, snapshot, assert_current, normalize_candidate,
                              preview, cost_panel, StaleDecisionError, DecisionRejected, schema_issues)
 from calc.triggers import tool_traits as describe_tool, observe_source, compile_candidate, control_messages
 from calc.progress import (WorkReport, MODES, EVENT_TYPES, OPERATIONS, allowed_operations,
@@ -223,7 +223,7 @@ class AdaptiveRuntime:
                 raise ValueError('case budgets must be positive integers or null')
         reserved = {"collaborate", "report_progress", "load_skill", "read_evidence", "read_history",
                     "complete_transferred_work", "discover_tools", "load_tools",
-                    "decide_collaboration", "commit_collaboration"}
+                    "decide_collaboration", "commit_collaboration", "revise_collaboration"}
         names = [t["function"]["name"] for t in tools]
         if reserved.intersection(names) or len(set(names)) != len(names):
             raise ValueError("duplicate or reserved tool names")
@@ -364,6 +364,11 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             params['required'] = ['selection', 'reason']
         return tool
 
+    def _scheduling_tools(self, actor: Loop, state: dict) -> list[dict]:
+        if actor.scheduling_candidate is None:
+            return [scoped_decision_tool(self, actor, state)]
+        return [self._commit_schema(actor), scoped_revision_tool(self, actor, state)]
+
     def _request(self, actor: Loop, scheduling_state: dict | None = None):
         messages = self._messages(actor)
         tools = [*self.registry.scoped(actor.allowed_tools).load(actor.loaded_tools), *self.execution_controls()]
@@ -373,17 +378,23 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             if self.compiled_triggers:
                 messages = control_messages(self, actor, scheduling_state)
             committing = actor.scheduling_candidate is not None
-            tools = [self._commit_schema(actor) if committing else scoped_decision_tool(self, actor, scheduling_state)]
+            tools = self._scheduling_tools(actor, scheduling_state)
             body = actor.scheduling_candidate if committing else scheduling_state
             messages.append({"role": "user", "content":
                 ("COMMIT STAGE. Inspect all same-work alternatives and their compiled costs. "
-                 "Call commit_collaboration exactly once using the provided schema. "
+                 "Use exactly ONE control call: commit_collaboration to keep/select the suggested plan, OR "
+                 "revise_collaboration to execute a better task-grounded operation. "
+                 "Suggested source families are not mandatory work boundaries: change branch goals/count, "
+                 "retain dependent work locally, or choose an allowed merge/fold when warranted. "
+                 "Compare continuation work and dependencies, not only the next prompt's bytes. "
+                 "No extra same-actor confirmation follows a valid revision; worker requests still need parent approval. "
                  "When selection is offered, choose keep or a listed fixed pattern; otherwise choose commit. "
                  "A keep selection (or commit=false) resumes the original session. If output_pressure exists, keep MUST "
                  "provide recovery_step={goal,tool} for exactly one already-loaded business tool. "
                  "No business tools or answer in this stage.\n" if committing else
                  "DECIDE STAGE. Call decide_collaboration exactly once. Compare unchanged continuation with "
-                 "a useful fixed-operation candidate; keep is fully valid. Only candidates list covered_work_ids. "
+                 "a useful fixed-operation candidate; keep is fully valid. covered_work_ids is optional for keep; "
+                 "if supplied it must match the snapshot's unfinished work. "
                  "Snapshot, event and evidence identity are bound by the runtime; do not echo hashes or IDs. "
                  "If output_pressure exists, keep MUST provide recovery_step={goal,tool} for exactly one "
                  "already-loaded business tool, rather than retrying the entire task; defer is not a recovery. "
@@ -469,17 +480,29 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                 calls = parse_tool_calls(response.message.get("tool_calls"))
             except ValueError as exc:
                 raise DecisionRejected('invalid_control_arguments', [{'detail': str(exc)}]) from None
-            tool = self._commit_schema(actor) if committing else scoped_decision_tool(self, actor, state)
-            if len(calls) != 1 or calls[0][1] != tool['function']['name']:
+            tools = {t['function']['name']: t for t in self._scheduling_tools(actor, state)}
+            if len(calls) != 1 or calls[0][1] not in tools:
                 raise DecisionRejected('wrong_control_batch', [{'detail': 'One decision call and no business actions required'}])
-            call, _, data = calls[0]
+            call, control_name, data = calls[0]
+            tool = tools[control_name]
             errors = list(Draft202012Validator(tool['function']['parameters']).iter_errors(data))
             if errors:
                 raise DecisionRejected('decision_schema', schema_issues(errors))
             assert_current(self, actor, state)
+            if 'covered_work_ids' in data and set(data['covered_work_ids']) != {u['work_id'] for u in state['work']}:
+                raise DecisionRejected('work_coverage', [{'detail': 'Supplied coverage must match the unfinished work snapshot'}])
             if committing:
                 item = actor.scheduling_candidate
-                if 'alternatives' in item:
+                revision = control_name == 'revise_collaboration'
+                if revision:
+                    try:
+                        chosen = normalize_candidate(actor, state, data)
+                        revised_shadow = preview(self, actor.id, chosen)
+                    except (ValueError, KeyError, TypeError) as exc:
+                        raise DecisionRejected('candidate_not_executable', [{'detail': str(exc)}]) from None
+                    revised_costs = cost_panel(self, revised_shadow, state)
+                    commit = True
+                elif 'alternatives' in item:
                     commit = data['selection'] != 'keep'
                     chosen = next((a['proposal'] for a in item['alternatives']
                                    if a['id'] == data['selection']), None)
@@ -493,6 +516,11 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                     except (ValueError, KeyError, TypeError) as exc:
                         raise DecisionRejected('candidate_not_executable', [{'detail': str(exc)}]) from None
                     acknowledge()
+                    if revision:
+                        self.emit('scheduling_revision', agent=actor.id, snapshot_id=state['snapshot_id'],
+                                  original_proposal=item['proposal'], proposal=chosen,
+                                  cost_panel=revised_costs,
+                                  meaning='Model revised the work plan; compiled costs logged, not a second approval')
                     outcome = self.change(actor.id, chosen)
                     actor.output_pressure = None
                     actor.recovery_step = None
@@ -507,11 +535,10 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                 actor.scheduling_suggestion = None
                 actor.scheduling_wait = {}
                 self.emit('scheduling_result', agent=actor.id, snapshot_id=state['snapshot_id'],
-                          decision=selected, reason=data['reason'], outcome=outcome)
+                          decision=selected, reason=data['reason'], outcome=outcome,
+                          revised=revision)
                 actor.messages.append({'role': 'user', 'content': 'Scheduling outcome: ' + json.dumps(outcome)})
                 return
-            if data['decision'] == 'candidate' and set(data['covered_work_ids']) != {u['work_id'] for u in state['work']}:
-                raise DecisionRejected('work_coverage', [{'detail': 'Candidate must cover the same unfinished work IDs'}])
             choice = data['decision']
             if choice == 'candidate':
                 if 'recovery_step' in data:
@@ -1410,6 +1437,7 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                             "scheduling_errors": sum(e['event'] == 'scheduling_error' for e in self.events),
                             "scheduling_rejections": sum(e['event'] == 'scheduling_rejected' for e in self.events),
                             "compiled_trigger_count": sum(e['event'] == 'trigger_fired' for e in self.events),
+                            "collaboration_revisions": sum(e['event'] == 'scheduling_revision' for e in self.events),
                             "output_pressure_count": sum(e['event'] == 'execution_output_truncated' for e in self.events),
                             "recovery_steps_completed": sum(e['event'] == 'recovery_step_completed' for e in self.events),
                             "progress_checkpoints": sum(e["event"] == "progress_checkpoint" for e in self.events),

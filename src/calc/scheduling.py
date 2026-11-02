@@ -74,7 +74,7 @@ def decision_tools(collaborate: dict) -> tuple[dict, dict]:
               'allOf': [
                   {'if': {'properties': {'decision': {'const': 'candidate'}}},
                    'then': {'required': ['proposal', 'covered_work_ids'], 'not': {'required': ['dependencies']}},
-                   'else': {'not': {'anyOf': [{'required': ['proposal']}, {'required': ['covered_work_ids']}]}}},
+                   'else': {'not': {'required': ['proposal']}}},
                   {'if': {'properties': {'decision': {'const': 'defer'}}},
                    'then': {'required': ['dependencies'],
                             'properties': {'dependencies': {'minItems': 1}}},
@@ -118,6 +118,28 @@ def scoped_decision_tool(runtime, actor, state: dict) -> dict:
     names(proposal['sources'], runtime.loops)
     proposal['receiver']['enum'] = list(runtime.loops)
     return tool
+
+
+def scoped_revision_tool(runtime, actor, state: dict) -> dict:
+    """One alternative to accepting a compiled plan, not another approval round.
+
+    The model supplies work and operation semantics; snapshot identity, evidence
+    and coverage remain runtime-owned. Reuse the existing proposal/permissions.
+    """
+    source = scoped_decision_tool(runtime, actor, state)['function']['parameters']['properties']
+    proposal = copy.deepcopy(source['proposal'])
+    proposal['properties']['operation']['enum'] = sorted(
+        set(proposal['properties']['operation']['enum']) & set(state['allowed_operations']))
+    return {'type': 'function', 'function': {'name': 'revise_collaboration',
+        'description': 'Replace the suggested organization with a task-grounded fixed operation. '
+                       'Preserve all unfinished responsibilities; you may change branch goals/count, '
+                       'pattern, or choose a permitted whole-loop merge/fold. '
+                       'No additional same-actor confirmation follows a valid revision. '
+                       'Worker proposals still require their existing parent approval.',
+        'parameters': {'type': 'object', 'additionalProperties': False,
+            'properties': {key: copy.deepcopy(source[key]) for key in ('reason', 'next_work')} |
+                          {'proposal': proposal},
+            'required': ['reason', 'next_work', 'proposal']}}}
 
 
 def snapshot(runtime, actor) -> dict:
@@ -204,8 +226,53 @@ def input_panel(runtime, ids: set[str]) -> dict:
                          'mean_output_tokens': sum(r['usage']['output_tokens'] for r in known) / len(known) if known else None,
                          'mean_elapsed_seconds': sum(elapsed) / len(elapsed) if elapsed else None}})
     return {'owners': rows, 'sum_next_input_utf8_bytes': sum(r['input_utf8_bytes'] for r in rows),
+            'sum_ready_input_utf8_bytes': sum(r['input_utf8_bytes'] for r in rows if r['status'] == 'ready'),
             'model_concurrency': runtime.concurrency, 'tool_commits': 'serial shared environment',
             'future_output_tokens': None, 'remaining_model_calls': None, 'remaining_wall_seconds': None}
+
+
+def continuation_panel(runtime, shadow, state: dict, keep: dict, candidate: dict) -> dict:
+    """Expose residual work and an unevaluated cost expression, not a forecast.
+
+    EAT motivates progress-grounded reorganization; EvoRouter motivates separating
+    configuration cost from downstream work. This independent implementation uses
+    no fitted utility, extra judge, invented turn horizon, or benchmark identity.
+    """
+    def owners(system, panel):
+        included = {row['agent'] for row in panel['owners']} | {unit['owner'] for unit in state['work']}
+        return [{'owner': a.id, 'status': a.status, 'goal': a.work.current_scope,
+                 'completion_condition': a.work.completion_condition,
+                 'unresolved': list(a.work.unresolved), 'next_step': a.work.next_step,
+                 'dependencies': list(a.dependencies), 'read_only': a.read_only,
+                 'transferred_work': [{'source': src.id, 'work': asdict(src.work)}
+                     for src in system.loops.values() if src.transferred_to == a.id and not src.resolved]}
+                for a in system.loops.values() if a.id in included and a.status in {'ready', 'waiting', 'review', 'failed'}]
+    result = {'keep': owners(runtime, keep), 'candidate': owners(shadow, candidate),
+              'comparison_rule': 'Compare the SAME remaining work, including parent integration and '
+                  'independent verification. Shared final writes do not imply dependent upstream reads. '
+                  'Source families are suggestions, not required branch boundaries. '
+                  'Include later context growth, redundant execution, control calls and handoff risk. '
+                  'Future progress, calls, Token and wall time are unknown.'}
+    children = [a for key, a in shadow.loops.items() if key not in runtime.loops]
+    parent = state['actor']
+    before = next((row for row in keep['owners'] if row['agent'] == parent), None)
+    after = next((row for row in candidate['owners'] if row['agent'] == parent), None)
+    if (children and all(a.parent == parent for a in children) and before and after
+            and shadow.loops[parent].status == 'waiting'):
+        child_ids = {a.id for a in children}
+        branch_bytes = sum(row['input_utf8_bytes'] for row in candidate['owners'] if row['agent'] in child_ids)
+        serial_bytes = len(children) * before['input_utf8_bytes']
+        result['conditional_readout'] = {
+            'unit': 'UTF8 input byte-calls; not Token or currency',
+            'variable': 'k = equal future solver turns per branch; k is NOT assigned or estimated',
+            'assumptions': ['Same remaining branch work performed inline or by children',
+                            'Equal k turns per branch, frozen present prompt sizes, one final parent join',
+                            'Excludes future tool outputs, output Token, control calls and all context growth',
+                            'Ignores previously spent calls; real tools still commit serially'],
+            'keep_expression': {'coefficient_k': serial_bytes, 'constant': before['input_utf8_bytes']},
+            'candidate_expression': {'coefficient_k': branch_bytes, 'constant': after['input_utf8_bytes']},
+            'meaning': 'Sensitivity scenario only. Do not use as a forecast or an automatic switch threshold.'}
+    return result
 
 
 def cost_panel(runtime, shadow, state: dict) -> dict:
@@ -215,6 +282,7 @@ def cost_panel(runtime, shadow, state: dict) -> dict:
     keep = input_panel(runtime, ids)
     candidate = input_panel(shadow, ids | new_ids | changed)
     return {'keep': keep, 'candidate': candidate,
+            'continuation': continuation_panel(runtime, shadow, state, keep, candidate),
             'next_input_byte_delta': keep['sum_next_input_utf8_bytes'] - candidate['sum_next_input_utf8_bytes'],
             'meaning': 'Compiled next solver-input bytes only, not Token, remaining total cost or causal savings. '
                        'Candidate includes actual transfer messages and capability schemas. '
