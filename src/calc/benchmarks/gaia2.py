@@ -151,7 +151,9 @@ class Gaia2Adapter:
                            "notifications": self.notifications}, ensure_ascii=False)
 
     def stopped(self):
-        return self.env.stop_event.is_set()
+        # ARE clears stop_event when its event loop exits. The terminal state
+        # remains authoritative; checking only that event would wait forever.
+        return self.env.state.value in {"STOPPED", "FAILED"} or self.env.stop_event.is_set()
 
     def wait_events(self):
         while not self.stopped():

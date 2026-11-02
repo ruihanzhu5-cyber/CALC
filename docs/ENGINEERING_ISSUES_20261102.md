@@ -16,5 +16,6 @@
 | 控制台宿主中断导致一批实验退出 | gaia2-adaptability3-flash-v2/monitor_interruption.json | 1a167cf已改pythonw+WSL systemd Restart=no，恢复用显式计划和retained SHA，本轮沿用 |
 | C盘空间/跨平台路径与shell转义 | 早期WSL/缓存问题及本轮WSL参数含比较符需正确传递 | D盘独立发行版/缓存/tmp；安装以明确版本字符串传入，避免shell把包版本比较符当重定向。不切换到C盘缓存默认实验路径 |
 | usage丢失/计量重复风险 | 中断actor_input无返回；runtime model_call与actor_request重复记录 | 最终成本只计真实actor/judge响应，孤立请求usage未知/下界，中断单列；新源码manifest覆盖新增模块和依赖 |
+| ARE停止后清空stop_event，适配器仍空等 | 本轮三bench各一题：GAIA2 trace已出现ENVIRONMENT_STOP，旧stopped仅看event；官方environment.py线程退出时清空该event | 追加修复：STOPPED/FAILED状态也是权威终态；环境在actor期间结束则对真实动作评分，不捏造回答。已添加清空标志及wait_events不空等回归。原9e99a8a尝试保留，停止其空等，不自动重跑actor |
 
 未声称本轮修复全部历史故障。后台托管、原生MANTA裁剪、复杂资源级重复写入仍分别记录，不能用无限重试或静默回退掩盖。

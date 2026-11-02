@@ -101,3 +101,32 @@ def test_gaia2_final_submission_classifier_does_not_read_evaluator():
     assert classifier('Chats__send_message', {}) is False
     assert classifier('evaluate', {}) is False
     assert touched == []
+
+
+def test_terminal_environment_is_detected_after_are_clears_stop_event():
+    from threading import Event
+    from enum import Enum
+    from calc.benchmarks.gaia2 import Gaia2Adapter
+    class State(Enum):
+        RUNNING = 'RUNNING'
+        PAUSED = 'PAUSED'
+        STOPPED = 'STOPPED'
+        FAILED = 'FAILED'
+    adapter = Gaia2Adapter.__new__(Gaia2Adapter)
+    flag = Event()
+    for state in State:
+        adapter.env = SimpleNamespace(state=state, stop_event=flag)
+        assert adapter.stopped() is (state in {State.STOPPED, State.FAILED})
+    adapter.env.state = State.RUNNING
+    flag.set()
+    assert adapter.stopped()
+
+
+def test_wait_events_returns_at_terminal_state_without_model_or_sleep(monkeypatch):
+    from threading import Event
+    from calc.benchmarks.gaia2 import Gaia2Adapter
+    adapter = Gaia2Adapter.__new__(Gaia2Adapter)
+    adapter.env = SimpleNamespace(state=SimpleNamespace(value='STOPPED'), stop_event=Event())
+    adapter.pending = lambda: (_ for _ in ()).throw(AssertionError('must not poll ended environment'))
+    monkeypatch.setattr('calc.benchmarks.gaia2.time.sleep', lambda n: (_ for _ in ()).throw(AssertionError('must not sleep')))
+    assert adapter.wait_events() == []

@@ -194,6 +194,7 @@ def main():
                       "handler": lambda a, name=t["function"]["name"]: public.invoke(name, a)}
                      for t in public.tools]
         turns = []
+        environment_ended_during_actor = False
         while not adapter.stopped():
             before = adapter.sent
             if args.method == "calc":
@@ -208,6 +209,9 @@ def main():
                 write(output / f"turn_{len(turns)}.json", asdict(result))
             turns.append(answer)
             if not answer:
+                if adapter.stopped():
+                    environment_ended_during_actor = True
+                    break  # score the real actions so far, without inventing an answer
                 raise RuntimeError("actor ended without an answer")
             if adapter.sent == before and not adapter.stopped():
                 public.invoke("AgentUserInterface__send_message_to_user", {"content": answer})
@@ -220,7 +224,7 @@ def main():
         session.finish()
         evaluation = session.evaluate(turns[-1] if turns else '')
         write(output / "evaluation.json", asdict(evaluation))
-        write(output / "result.json", {"status": "completed", "answers": turns,
+        write(output / "result.json", {"status": "environment_ended" if environment_ended_during_actor else "completed", "answers": turns,
             "success": evaluation.success, "wall_seconds": time.perf_counter() - started,
             "actor_usage": aggregate_usage([r for r in rows if r["event"] == "actor_request"]),
             "judge_usage": aggregate_usage([r for r in rows if r["event"] == "judge_request"])})
