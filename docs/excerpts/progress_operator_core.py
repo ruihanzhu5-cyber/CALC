@@ -36,7 +36,7 @@ class WorkReport:
 
 
 # SOURCE src/calc/triggers.py:56  compile_candidate
-# SHA256 bb49863ae9ffa672020429c39d41279d666331adbdb4c41c64de8be0d5849b83
+# SHA256 6a1cacb5391622f78f1e78b0c92ba5245ab50864a59b0d34c627f15bc047a6f4
 def compile_candidate(runtime, actor, state: dict) -> dict | None:
     allowed = allowed_operations(runtime.collaboration_mode, runtime.initial_open, actor.parent is None)
     # Whole-loop transfer only. A factual overlap or output exhaustion opens a
@@ -207,7 +207,7 @@ def continuation_panel(runtime, shadow, state: dict, keep: dict, candidate: dict
 
 
 # SOURCE src/calc/adaptive.py:374  AdaptiveRuntime.collaboration_receipts
-# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
+# SHA256 5711eb2f696725d991e46cd295da2fa59e7022baf1263af141fd2ab2be8044cc
 def collaboration_receipts(self) -> list[dict]:
     """Execution facts, not agent claims or calibrated contribution scores."""
     groups = {}
@@ -230,14 +230,14 @@ def collaboration_receipts(self) -> list[dict]:
 
 
 # SOURCE src/calc/adaptive.py:394  AdaptiveRuntime._requires_expansion
-# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
+# SHA256 5711eb2f696725d991e46cd295da2fa59e7022baf1263af141fd2ab2be8044cc
 def _requires_expansion(self, actor: Loop) -> bool:
     return (self.collaboration_requirement == 'required_parallel' and self.collaboration_gate_active and
             actor.id == 'main' and not self.collaboration_receipts() and not self._live_children(actor.id))
 
 
 # SOURCE src/calc/adaptive.py:398  AdaptiveRuntime._validate_required_plan
-# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
+# SHA256 5711eb2f696725d991e46cd295da2fa59e7022baf1263af141fd2ab2be8044cc
 def _validate_required_plan(self, actor: Loop, proposal: dict) -> None:
     pending_root_plan = (self.collaboration_requirement == 'required_parallel' and actor.id == 'main'
                          and not self.collaboration_receipts() and proposal.get('operation') == 'delegate')
@@ -251,7 +251,7 @@ def _validate_required_plan(self, actor: Loop, proposal: dict) -> None:
 
 
 # SOURCE src/calc/adaptive.py:699  AdaptiveRuntime._compile_opportunity
-# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
+# SHA256 5711eb2f696725d991e46cd295da2fa59e7022baf1263af141fd2ab2be8044cc
 def _compile_opportunity(self, actor: Loop, state: dict) -> bool:
     item = compile_candidate(self, actor, state)
     if item is None:
@@ -290,7 +290,7 @@ def _compile_opportunity(self, actor: Loop, state: dict) -> bool:
 
 
 # SOURCE src/calc/adaptive.py:522  AdaptiveRuntime._accept_decision
-# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
+# SHA256 5711eb2f696725d991e46cd295da2fa59e7022baf1263af141fd2ab2be8044cc
 def _accept_decision(self, actor: Loop, response: Any, error: str | None, state: dict) -> None:
     """One explicit control stage; no business actions or implicit JSON repair."""
     committing = actor.scheduling_candidate is not None
@@ -450,7 +450,7 @@ def _accept_decision(self, actor: Loop, response: Any, error: str | None, state:
 
 
 # SOURCE src/calc/adaptive.py:862  AdaptiveRuntime.change
-# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
+# SHA256 5711eb2f696725d991e46cd295da2fa59e7022baf1263af141fd2ab2be8044cc
 def change(self, actor_id: str, p: dict) -> dict:
     actor = self.loops[actor_id]
     p = self._expand_proposal(actor, p)
@@ -507,7 +507,7 @@ def change(self, actor_id: str, p: dict) -> dict:
 
 
 # SOURCE src/calc/adaptive.py:940  AdaptiveRuntime._apply_change
-# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
+# SHA256 5711eb2f696725d991e46cd295da2fa59e7022baf1263af141fd2ab2be8044cc
 def _apply_change(self, actor_id: str, p: dict) -> dict:
     """Validate the full transition before mutations; called only at a wave barrier."""
     actor = self.loops[actor_id]
@@ -677,8 +677,8 @@ def _apply_change(self, actor_id: str, p: dict) -> dict:
     return {"operation": operation, "receiver": receiver_id, "sources": source_ids}
 
 
-# SOURCE src/calc/adaptive.py:1253  AdaptiveRuntime._accept
-# SHA256 49ea1b4df8a7241315124845d8f5f16572869d1cb9d3f6cd1439f86223566402
+# SOURCE src/calc/adaptive.py:1254  AdaptiveRuntime._accept
+# SHA256 5711eb2f696725d991e46cd295da2fa59e7022baf1263af141fd2ab2be8044cc
 def _accept(self, actor: Loop, response: Any, error: str | None, pending: list,
             required_checkpoints: list[str] | None = None, request_version: int | None = None,
             request_epoch: int | None = None) -> None:

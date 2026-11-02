@@ -1195,7 +1195,7 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             actor.first_observation = True
             self._checkpoint(actor, 'first_observation', actor.id,
                              {'evidence_id': evidence_id, 'meaning': 'First environment observation; assess the actual task state'})
-        facts = collection_facts(output)
+        facts = collection_facts(output) if traits.get('category', 'task') == 'task' else []
         observe_source(self, actor, evidence_id, traits, facts)
         for fact_info in facts:
             identity = fingerprint([name, args.get("app"), args.get("api"), fact_info])
@@ -1211,7 +1211,8 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                            "same_output": previous["fact"] == fact,
                            "same_world_version": previous.get('world_version') == self.world_version}
             self.emit("repeated_access", agent=actor.id, **observation)
-            if self.scheduling == 'explicit' and observation['same_output'] and observation['same_world_version']:
+            if (self.scheduling == 'explicit' and traits.get('category', 'task') == 'task' and
+                    observation['same_output'] and observation['same_world_version']):
                 self._checkpoint(actor, 'overlap', fingerprint([key, previous['agent'], previous['fact'], fact]), observation)
         if key is not None:
             self.resources[key] = {"agent": actor.id, "evidence_id": evidence_id, "fact": fact,

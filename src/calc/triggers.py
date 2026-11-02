@@ -29,7 +29,7 @@ def tool_traits(runtime, name: str, arguments: dict) -> dict:
 
 
 def observe_source(runtime, actor, evidence_id: str, traits: dict, facts: list[dict]) -> None:
-    if traits['effect'] != 'read' or not facts:
+    if traits['effect'] != 'read' or traits.get('category', 'task') != 'task' or not facts:
         return
     family = traits['family']
     old = actor.read_sources.get(family)

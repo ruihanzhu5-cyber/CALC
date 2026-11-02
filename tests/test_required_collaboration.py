@@ -81,6 +81,22 @@ def test_documentation_only_or_claimed_worker_success_cannot_satisfy_requirement
     assert rt.collaboration_receipts() == []
 
 
+def test_shared_capability_reads_do_not_trigger_task_splitting_or_takeover():
+    from calc.triggers import compile_candidate
+    rt = required(tool_traits=lambda n,a:{'effect':'read','family':n,'label':n,'category':'capability'})
+    main = rt._new('task', None, 'strong', [])
+    rt._tool(main, 'north', {})
+    rt._tool(main, 'south', {})
+    assert not main.read_sources
+    assert compile_candidate(rt, main, snapshot(rt, main)) is None
+    child = rt._new('different work using shared docs', main.id, 'weak', [])
+    child.read_only = True
+    rt._tool(child, 'north', {})
+    assert any(e['event'] == 'repeated_access' for e in rt.events)
+    assert not any(e['type'] == 'overlap' for e in child.checkpoints.values())
+    assert compile_candidate(rt, child, snapshot(rt, child)) is None
+
+
 def test_required_plan_cannot_be_changed_to_inline_or_unrestricted_readers():
     rt = required()
     main, _ = frontier(rt)
