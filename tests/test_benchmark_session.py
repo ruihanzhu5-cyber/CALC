@@ -20,7 +20,8 @@ def test_actor_capabilities_exclude_evaluation_and_metadata_and_close_after_fini
     scored = []
     session = make_session(evaluate=lambda answer: scored.append(answer) or {'native_result': 7})
     port = session.actor_environment()
-    assert {f.name for f in fields(ActorEnvironment)} == {'tools', 'invoke', 'context', 'events'}
+    assert {f.name for f in fields(ActorEnvironment)} == {
+        'tools', 'invoke', 'context', 'events', 'is_final_submission'}
     assert not hasattr(port, 'evaluate') and not hasattr(port, 'task')
     with pytest.raises(RuntimeError, match='during actor'):
         session.evaluate('premature')
@@ -109,3 +110,26 @@ def test_public_schema_copy_cannot_change_session_tool_catalog():
     assert session.actor_environment().tools[0]['function']['name'] == 'read'
     with pytest.raises(ValueError):
         port.invoke('score', {})
+
+
+def test_final_submission_classifier_is_public_fact_not_evaluation(monkeypatch):
+    scored, received = [], {}
+    classifier = lambda name, args: name == 'read' and args.get('final') is True
+    session = make_session(is_final_submission=classifier,
+                           evaluate=lambda answer: scored.append(answer))
+    port = session.actor_environment()
+    assert port.is_final_submission('read', {'final': True}) is True
+    assert port.is_final_submission('read', {}) is False
+    assert not hasattr(port, 'evaluate') and not hasattr(port, '_evaluate')
+    assert scored == []
+    def capture(**kwargs):
+        received.update(kwargs)
+        return object()
+    monkeypatch.setattr('calc.adaptive.AdaptiveRuntime', capture)
+    adaptive_runtime(port, strong=object(), weak=object(), options={})
+    assert received['is_final_submission'] is classifier
+    assert 'evaluate' not in received and scored == []
+
+
+def test_final_submission_classifier_is_optional_for_existing_environments():
+    assert make_session().actor_environment().is_final_submission is None

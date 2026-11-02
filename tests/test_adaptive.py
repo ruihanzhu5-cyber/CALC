@@ -75,7 +75,7 @@ def setup_three(**kwargs):
 def test_ordinary_tool_results_do_not_wake_parent():
     strong = Scripted([change(operation='delegate', pattern='parallel', branches=[{'goal': 'lookup'}]), response('global')])
     weak = Scripted([response(tool='lookup', args={'n': n}) for n in range(4)] + [response('found')])
-    rt = runtime(strong, weak, tools=[function('lookup', 'read', {}, [])])
+    rt = runtime(strong, weak, tools=[function('lookup', 'read', {'n': {'type': 'integer'}}, [])])
     result = rt.run('task')
     assert result['answer'] == 'global'
     assert len(strong.received) == 2
@@ -130,7 +130,7 @@ def test_blocked_event_allows_parent_fold_and_actual_takeover():
         response(tool='complete_transferred_work', args={'source': 'agent_1', 'result': 'found 43'}), response('global')])
     weak = Scripted([response(tool='lookup', args={'id': '41'}), change(event_type='blocked'), response(tool='lookup', args={'id': '42'})])
     executed = []
-    rt = runtime(strong, weak, max_waves=12, tools=[function('lookup', 'read', {}, [])],
+    rt = runtime(strong, weak, max_waves=12, tools=[function('lookup', 'read', {'id': {'type': 'string'}}, [])],
                  invoke=lambda n, a: executed.append(a['id']) or a,
                  skills={'lookup': {'description': 'procedure', 'body': 'read IDs exactly'}})
     result = rt.run('task')
@@ -182,7 +182,7 @@ def test_worker_recursively_delegates_via_normal_parent_decision():
 
 
 def test_merge_then_fold_keeps_history_and_executes_receiver_tools():
-    rt, m, a, b = setup_three(tools=[function('lookup', 'read', {}, [])])
+    rt, m, a, b = setup_three(tools=[function('lookup', 'read', {'id': {'type': 'string'}}, [])])
     rt._accept(a, response(tool='lookup', args={'id': 'original'}), None, [])
     rt.change(m.id, proposal(rt, operation='merge', sources=[a.id], receiver=b.id))
     rt.change(m.id, proposal(rt, operation='fold', sources=[b.id], receiver=m.id))
@@ -271,7 +271,7 @@ def test_same_blocked_report_does_not_wake_parent_again():
 
 def test_late_response_after_migration_cannot_execute_source_or_receiver_tools():
     executed = []
-    rt, m, a, b = setup_three(tools=[function('read', 'read', {}, [])],
+    rt, m, a, b = setup_three(tools=[function('read', 'read', {'current': {'type': 'string'}}, [])],
                               invoke=lambda n, args: executed.append(args))
     source_epoch, receiver_epoch = a.owner_epoch, b.owner_epoch
     rt.change(m.id, proposal(rt, operation='merge', sources=[a.id], receiver=b.id))

@@ -26,9 +26,10 @@ PUBLIC_CONTEXT = ("All APIs operate in one shared local task environment. "
 API_TOOL = function("appworld_api", "Call an official API in the shared task environment. "
     "Discover APIs with api_docs.show_app_descriptions, show_api_descriptions(app_name), "
     "show_api_doc(app_name, api_name). Only Main should use supervisor.complete_task, when finished. "
-    "arguments_json is a JSON object string; no Python code or persistent variables.", {
+    "Pass arguments as a JSON object directly, never as a JSON-encoded string. "
+    "No Python code or persistent variables.", {
         "app": {"type": "string"}, "api": {"type": "string"},
-        "arguments_json": {"type": "string"}}, ["app", "api", "arguments_json"])
+        "arguments": {"type": "object", "additionalProperties": True}}, ["app", "api", "arguments"])
 
 
 def verify_source(repo: Path) -> dict:
@@ -82,23 +83,26 @@ class AppWorldAdapter:
         self.tool_calls = 0
 
     def invoke(self, name: str, args: dict) -> str:
-        if name != "appworld_api" or set(args) != {"app", "api", "arguments_json"}:
+        if name != "appworld_api" or set(args) != {"app", "api", "arguments"}:
             raise ValueError("only the documented AppWorld API interface is allowed")
         app, api = args["app"], args["api"]
         if not all(isinstance(x, str) and re.fullmatch(r"[a-z][a-z0-9_]*", x) for x in (app, api)):
             raise ValueError("invalid API identifier")
         if f"{app}__{api}" not in self.catalog:
             raise ValueError("API not in this task's official public API catalog")
-        parameters = json.loads(args["arguments_json"])
+        parameters = args["arguments"]
         if not isinstance(parameters, dict):
-            raise ValueError("arguments_json must decode to an object")
+            raise ValueError("arguments must be a JSON object, not an encoded string")
         json.dumps(parameters, allow_nan=False)
         code = f"print(apis.{app}.{api}(**{parameters!r}))"
         with self.lock:
             if self.phase != "execute":
                 raise RuntimeError("task execution has ended")
             self.tool_calls += 1
-            return self.world.execute(code)
+            output = self.world.execute(code)
+            if isinstance(output, str) and output.startswith("Execution failed. Traceback:"):
+                raise RuntimeError(output)
+            return output
 
     def finish(self) -> None:
         with self.lock:
@@ -123,4 +127,6 @@ class AppWorldAdapter:
 
     def session(self) -> EvaluationSession:
         return EvaluationSession(tools=self.tools, invoke=self.invoke, context=PUBLIC_CONTEXT,
-            finish=self.finish, evaluate=lambda answer: self.evaluate(), close=self.close)
+            finish=self.finish, evaluate=lambda answer: self.evaluate(), close=self.close,
+            is_final_submission=lambda name, args: name == "appworld_api"
+                and args.get("app") == "supervisor" and args.get("api") == "complete_task")

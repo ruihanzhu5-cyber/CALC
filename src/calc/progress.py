@@ -82,10 +82,15 @@ def collection_facts(output) -> list[dict]:
 
     def visit(value, path):
         if isinstance(value, dict):
-            # Inspect primary result envelopes only. Embedded metadata such as an
-            # individual record's artists/tags is not a newly discovered work set.
+            # An identified object is a record, not a result envelope. Do not
+            # misinterpret its artists/tags as additional task objects. Containers
+            # without their own ID may use any public field name (events, contacts,
+            # etc.); benchmark-specific envelope spelling is not an API contract.
+            if any((key == "id" or key.endswith("_id")) and type(child) in (str, int)
+                   for key, child in value.items()):
+                return
             for key, child in value.items():
-                if key in {"results", "items", "records", "data"} and isinstance(child, (list, dict)):
+                if isinstance(child, (list, dict)):
                     visit(child, f"{path}/{key}")
         elif isinstance(value, list) and len(value) > 1 and all(isinstance(v, dict) for v in value):
             fields = set.intersection(*(set(v) for v in value))

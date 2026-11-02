@@ -85,3 +85,19 @@ def test_notification_does_not_wake_waiting_parent_without_user_message():
     rt._poll_external()
     rt._poll_external()
     assert main.status == 'waiting' and main.version == version and len(main.inbox) == 1
+
+
+def test_gaia2_final_submission_classifier_does_not_read_evaluator():
+    from calc.benchmarks.gaia2 import Gaia2Adapter
+    adapter = Gaia2Adapter.__new__(Gaia2Adapter)
+    touched = []
+    adapter.tools = []
+    adapter.invoke = lambda name, args: touched.append('invoke')
+    adapter.pending = lambda: []
+    adapter.close = lambda: None
+    adapter.evaluate = lambda: touched.append('evaluate')
+    classifier = adapter.session().actor_environment().is_final_submission
+    assert classifier('AgentUserInterface__send_message_to_user', {}) is True
+    assert classifier('Chats__send_message', {}) is False
+    assert classifier('evaluate', {}) is False
+    assert touched == []

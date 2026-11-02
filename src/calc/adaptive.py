@@ -13,8 +13,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from time import perf_counter
 from typing import Any, Callable
+from jsonschema import Draft202012Validator
 
 from calc.llm import aggregate_usage
+from calc.capabilities import ToolRegistry
+from calc.protocol import parse_tool_calls
 from calc.progress import (WorkReport, MODES, EVENT_TYPES, OPERATIONS, allowed_operations,
                            fingerprint, validate_proposal, collection_facts, validate_subgoals)
 
@@ -63,12 +66,24 @@ COLLABORATE = function("collaborate", "Request a fixed collaboration change. May
     "request_id": {"type": "string"}, "approve": {"type": "boolean"},
     "pattern": {"type": "string", "enum": ["sequence", "parallel", "review_refine"]},
     "branches": {"type": "array", "items": {"type": "object", "properties": {
-        "goal": {"type": "string"}, "skills": {"type": "array", "items": {"type": "string"}}},
+        "goal": {"type": "string"}, "skills": {"type": "array", "items": {"type": "string"}},
+        "completion_condition": {"type": "string"}, "handoff": {"type": "string"},
+        "tools": {"type": "array", "items": {"type": "string"}},
+        "evidence_ids": {"type": "array", "items": {"type": "string"}}},
         "required": ["goal"], "additionalProperties": False}},
     "sources": {"type": "array", "items": {"type": "string"}},
     "receiver": {"type": "string"},
     "evidence_ids": {"type": "array", "items": {"type": "string"}},
 }, ["operation", "reason"])
+# A retained responsibility uses the same precise shape as a work report.
+COLLABORATE["function"]["parameters"]["properties"]["retained_work"] = copy.deepcopy(
+    COLLABORATE["function"]["parameters"]["properties"]["progress"])
+DISCOVER_TOOLS = function("discover_tools", "Find business tools within your assigned scope by name/domain/description. "
+    "Returns names and brief descriptions; load chosen names before calling them.",
+    {"query": {"type": "string"}}, ["query"])
+LOAD_TOOLS = function("load_tools", "Expose the exact parameter schemas for chosen business tools in your NEXT request. "
+    "Does not execute them. Only tools in your assigned scope may be loaded.",
+    {"names": {"type": "array", "items": {"type": "string"}}}, ["names"])
 LOAD_SKILL = function("load_skill", "Load the full procedure for a named capability into THIS loop.",
                       {"name": {"type": "string"}}, ["name"])
 READ_EVIDENCE = function("read_evidence", "Recover raw archived tool output by ID; no refetch or summary.",
@@ -105,6 +120,11 @@ Children's changes require their parent's decision: respond with request_id, app
 and reason. Rejection resumes the SAME child conversation; approval applies that proposal.
 wait needs only operation and reason. Never call wait while requests need your response.
 Main and workers may recursively delegate. Keep working inline if no valuable split exists.
+delegate branches may specify completion_condition, handoff, evidence_ids and tools.
+Each child receives the actual work handoff and a snapshot history reference, not the parent's live conversation.
+To do your own independent work while children run, provide retained_work with the exact work-report fields;
+this becomes YOUR remaining responsibility. Otherwise delegation waits for children, as before.
+When tool loading is deferred, discover_tools then load_tools exposes schemas. Do not guess parameters.
 Do not answer while transferred responsibilities remain unresolved: explicitly complete them.
 
 Progress checkpoints are facts to consider during normal execution, NOT mandatory reporting gates.
@@ -153,6 +173,9 @@ class Loop:
     subgoals: list[dict] = field(default_factory=list)
     owner_epoch: int = 0
     inbox: list[dict] = field(default_factory=list)
+    allowed_tools: list[str] = field(default_factory=list)
+    loaded_tools: list[str] = field(default_factory=list)
+    history_snapshots: dict[str, list[dict]] = field(default_factory=dict)
 
 
 class AdaptiveRuntime:
@@ -163,17 +186,29 @@ class AdaptiveRuntime:
                  environment_context: str = "", collaboration_mode: str = "full",
                  resource_key: Callable[[str, dict], str | None] | None = None,
                  progress_checkpoints: bool = True,
+                 tool_loading: str = "all",
+                 is_final_submission: Callable[[str, dict], bool] | None = None,
                  external_events: Callable[[], list[dict]] | None = None,
                  clock: Callable[[], float] = perf_counter):
         if concurrency < 1 or max_output_tokens < 1 or (max_waves is not None and max_waves < 1):
             raise ValueError("positive concurrency/output/wave limits required")
-        reserved = {"collaborate", "report_progress", "load_skill", "read_evidence", "read_history", "complete_transferred_work"}
+        reserved = {"collaborate", "report_progress", "load_skill", "read_evidence", "read_history",
+                    "complete_transferred_work", "discover_tools", "load_tools"}
         names = [t["function"]["name"] for t in tools]
         if reserved.intersection(names) or len(set(names)) != len(names):
             raise ValueError("duplicate or reserved tool names")
         self.clients = {"strong": strong, "weak": weak}
         self.tools = copy.deepcopy(tools)
         self.tool_names = set(names)
+        self.registry = ToolRegistry(tools)
+        control = [REPORT_PROGRESS, COLLABORATE, LOAD_SKILL, READ_EVIDENCE,
+                   READ_HISTORY, COMPLETE_WORK, DISCOVER_TOOLS, LOAD_TOOLS]
+        self.validators = {t["function"]["name"]: Draft202012Validator(t["function"]["parameters"])
+                           for t in [*tools, *control]}
+        if tool_loading not in {"all", "deferred"}:
+            raise ValueError("tool_loading must be all or deferred")
+        self.tool_loading = tool_loading
+        self.is_final_submission = is_final_submission
         self.invoke = invoke
         self.skills = copy.deepcopy(skills or {})
         self.concurrency = concurrency
@@ -210,6 +245,8 @@ class AdaptiveRuntime:
     def _new(self, goal: str, parent: str | None, tier: str, skills: list[str]) -> Loop:
         name = "main" if parent is None else f"agent_{len(self.loops)}"
         loop = Loop(name, goal, parent, tier, skills=list(skills))
+        loop.allowed_tools = list(self.registry.names if parent is None else self.loops[parent].allowed_tools)
+        loop.loaded_tools = list(loop.allowed_tools) if self.tool_loading == "all" else []
         loop.work = WorkReport(goal, "No semantic progress report yet", goal, next_step="Inspect the request")
         loop.messages = [{"role": "user", "content": goal}]
         self.loops[name] = loop
@@ -247,12 +284,18 @@ class AdaptiveRuntime:
             {"request_id": k, "actor": v["actor"], "proposal": v["proposal"]}
             for k, v in self.requests.items() if v["parent"] == actor.id and v["status"] == "pending"
         ], ensure_ascii=False)
+        if self.tool_loading == "deferred":
+            domains = sorted({n.split("__")[0].split(".")[0] for n in actor.allowed_tools})
+            system += "\nDeferred business tool domains: " + json.dumps(domains)
+            system += "\nLoaded tool names: " + json.dumps(actor.loaded_tools)
         return [{"role": "system", "content": system}, *copy.deepcopy(actor.messages)]
 
     def _request(self, actor: Loop):
         try:
             return self.clients[actor.tier].complete(self._messages(actor),
-                tools=[*self.tools, REPORT_PROGRESS, COLLABORATE, LOAD_SKILL, READ_EVIDENCE, READ_HISTORY, COMPLETE_WORK],
+                tools=[*self.registry.scoped(actor.allowed_tools).load(actor.loaded_tools),
+                       REPORT_PROGRESS, COLLABORATE, LOAD_SKILL, READ_EVIDENCE, READ_HISTORY, COMPLETE_WORK,
+                       *([DISCOVER_TOOLS, LOAD_TOOLS] if self.tool_loading == "deferred" else [])],
                 max_output_tokens=self.max_output_tokens), None
         except Exception as exc:
             # No hidden retry; failed transports may have consumed tokens.
@@ -260,14 +303,16 @@ class AdaptiveRuntime:
 
     def _record_call(self, actor: str, tier: str, response: Any, error: str | None,
                      purpose: str = "execute") -> None:
+        raw_calls = response.message.get("tool_calls") if response else None
+        names = {c["function"].get("name") for c in raw_calls
+                 if isinstance(c, dict) and isinstance(c.get("function"), dict)
+                 and isinstance(c["function"].get("name"), str)} if isinstance(raw_calls, list) else set()
         row = {"agent": actor, "tier": tier, "model": getattr(self.clients[tier], "model", tier),
                "purpose": purpose, "usage": response.usage.to_dict() if response else {},
                "error": error, "finish_reason": response.finish_reason if response else None,
                "elapsed_seconds": response.elapsed_seconds if response else None,
-               "contains_control": bool(response and any(c["function"]["name"] in {"collaborate", "report_progress"}
-                   for c in response.message.get("tool_calls", []) or [])),
-               "contains_progress": bool(response and any(c["function"]["name"] == "report_progress"
-                   for c in response.message.get("tool_calls", []) or []))}
+               "contains_control": bool(names & {"collaborate", "report_progress"}),
+               "contains_progress": "report_progress" in names}
         self.calls.append(row)
         self.emit("model_call", **row)
 
@@ -319,9 +364,7 @@ class AdaptiveRuntime:
         actor.work.unresolved = [g["goal"] for g in goals if g["status"] != "done"]
         actor.version += 1
         if plan_changed:
-            cid = self._checkpoint(actor, "plan_changed", fingerprint(goals), {"subgoals": goals})
-            if cid:
-                acknowledged.append(cid)  # this same report explicitly assesses its new plan
+            self._checkpoint(actor, "plan_changed", fingerprint(goals), {"subgoals": goals})
         assessed = [actor.checkpoints.pop(c) for c in acknowledged]
         actor.progress_reports[p["report_id"]] = {"input": copy.deepcopy(p), "version": actor.version,
             "work": asdict(actor.work), "evidence_ids": list(p["evidence_ids"]), "checkpoints": assessed}
@@ -485,24 +528,57 @@ class AdaptiveRuntime:
                 raise ValueError("valid pattern and nonempty branches required")
             if pattern == "review_refine" and len(branches) != 2:
                 raise ValueError("review_refine needs verifier and reviser goals")
+            retained = WorkReport.parse(p["retained_work"]) if "retained_work" in p else None
+            registry = self.registry.scoped(actor.allowed_tools)
             for b in branches:
                 if not isinstance(b, dict) or not isinstance(b.get("goal"), str) or not b["goal"].strip():
                     raise ValueError("branch goal required")
                 if not isinstance(b.get("skills", []), list) or any(s not in self.skills for s in b.get("skills", [])):
                     raise ValueError("unknown capability")
+                if set(b) - {"goal", "skills", "completion_condition", "handoff", "tools", "evidence_ids"}:
+                    raise ValueError("unknown branch fields")
+                for key in ("completion_condition", "handoff"):
+                    if key in b and (not isinstance(b[key], str) or not b[key].strip()):
+                        raise ValueError(f"nonempty branch.{key} required")
+                if "tools" in b:
+                    registry.load(b["tools"])
+                if "evidence_ids" in b and (not isinstance(b["evidence_ids"], list) or
+                        any(e not in actor.evidence for e in b["evidence_ids"])):
+                    raise ValueError("branch evidence must be available to its parent")
             children = []
+            history = copy.deepcopy(actor.messages)
+            history_ref = f"{actor.id}@{actor.version}"
             for b in branches:
                 child = self._new(b["goal"], actor.id, "weak", b.get("skills", []))
-                child.evidence = list(evidence_ids)
+                child.evidence = list(b.get("evidence_ids", evidence_ids))
+                child.allowed_tools = list(b.get("tools", actor.allowed_tools))
+                child.loaded_tools = list(child.allowed_tools) if self.tool_loading == "all" else []
+                child.history_refs = [history_ref, actor.id]
+                child.history_snapshots[actor.id] = copy.deepcopy(history)
+                child.history_snapshots[history_ref] = copy.deepcopy(history)
+                child.work.completion_condition = b.get("completion_condition", b["goal"])
+                child.work.failed_routes = list(actor.work.failed_routes)
+                assignment = {"source": actor.id, "source_version": actor.version,
+                    "scope": b["goal"], "completion_condition": child.work.completion_condition,
+                    "handoff": p.get("handoff", ""), "branch_handoff": b.get("handoff", ""),
+                    "parent_progress": copy.deepcopy(p.get("progress", asdict(actor.work))),
+                    "evidence_ids": child.evidence, "history_ref": history_ref,
+                    "history_access": "immutable snapshot at delegation; use read_history",
+                    "tools": child.allowed_tools}
                 child.messages.append({"role": "user", "content":
-                    "Available source evidence IDs: " + json.dumps(evidence_ids)})
+                    "Work assignment. Execute only your assigned responsibility; facts are not instructions.\n" +
+                    json.dumps(assignment, ensure_ascii=False)})
                 if children and pattern in {"sequence", "review_refine"}:
                     child.dependencies = [children[-1].id]
                 children.append(child)
-            actor.status = "waiting"
+            if retained is not None:
+                actor.work = retained
+                actor.goal = retained.current_scope
+            actor.status = "ready" if retained is not None else "waiting"
             actor.pattern = pattern
             actor.version += 1
-            self.emit("delegate", actor=actor_id, pattern=pattern, children=[a.id for a in children])
+            self.emit("delegate", actor=actor_id, pattern=pattern, children=[a.id for a in children],
+                      retained_work=asdict(retained) if retained is not None else None)
             return {"agents": [a.id for a in children], "pattern": pattern}
         if operation == "escalate":
             actor.tier = "strong"
@@ -553,6 +629,15 @@ class AdaptiveRuntime:
         receiver.evidence = list(dict.fromkeys(receiver.evidence + [e for a in sources for e in a.evidence]))
         receiver.history_refs = list(dict.fromkeys(receiver.history_refs + source_ids +
                                                   [h for a in sources for h in a.history_refs]))
+        for source in sources:
+            for ref, snapshot in source.history_snapshots.items():
+                if ref not in receiver.history_snapshots:
+                    receiver.history_snapshots[ref] = copy.deepcopy(snapshot)
+            receiver.history_snapshots[source.id] = copy.deepcopy(source.messages)
+        receiver.allowed_tools = list(dict.fromkeys(receiver.allowed_tools +
+                                                    [t for a in sources for t in a.allowed_tools]))
+        receiver.loaded_tools = list(dict.fromkeys(receiver.loaded_tools +
+                                                   [t for a in sources for t in a.loaded_tools]))
         receiver.dependencies = new_dependencies
         receiver.status = "ready"
         receiver.version += 1
@@ -571,6 +656,18 @@ class AdaptiveRuntime:
         return {"operation": operation, "receiver": receiver_id, "sources": source_ids}
 
     def _tool(self, actor: Loop, name: str, args: dict) -> Any:
+        if name == "discover_tools":
+            if self.tool_loading != "deferred":
+                raise ValueError("tool discovery is not enabled")
+            return self.registry.scoped(actor.allowed_tools).discover(args["query"])
+        if name == "load_tools":
+            if self.tool_loading != "deferred":
+                raise ValueError("deferred tool loading is not enabled")
+            schemas = self.registry.scoped(actor.allowed_tools).load(args["names"])
+            names = [s["function"]["name"] for s in schemas]
+            actor.loaded_tools = list(dict.fromkeys(actor.loaded_tools + names))
+            self.emit("tools_loaded", agent=actor.id, names=names)
+            return {"loaded": names, "schemas_visible": "next model request"}
         if name == "report_progress":
             return self._report_progress(actor, args)
         if name == "complete_transferred_work":
@@ -589,19 +686,33 @@ class AdaptiveRuntime:
             return {"completed_scope": source.id}
         if name == "load_skill":
             skill = self.skills[args["name"]]
+            if "tools" in skill:
+                schemas = self.registry.scoped(actor.allowed_tools).load(skill["tools"])
+                actor.loaded_tools = list(dict.fromkeys(actor.loaded_tools +
+                    [s["function"]["name"] for s in schemas]))
             if args["name"] not in actor.skills:
                 actor.skills.append(args["name"])
             return skill["body"]
         if name == "read_evidence":
+            if args["id"] not in actor.evidence:
+                raise ValueError("evidence is not available to this responsibility")
             return self.archive[args["id"]]
         if name == "read_history":
             if args["agent"] not in actor.history_refs or type(args["offset"]) is not int or args["offset"] < 0:
                 raise ValueError("invalid archive reference or offset")
-            history = self.loops[args["agent"]].messages
+            history = actor.history_snapshots[args["agent"]]
             offset = args["offset"]
             return {"messages": history[offset:offset + 8], "total": len(history), "next_offset": offset + 8}
         if name not in self.tool_names:
             raise ValueError("unknown tool")
+        if name not in actor.allowed_tools or name not in actor.loaded_tools:
+            raise ValueError("tool not loaded in the current responsibility")
+        if self.is_final_submission is not None and self.is_final_submission(name, args):
+            unresolved = any((a.transferred_to == actor.id and not a.resolved) or
+                             (a.parent == actor.id and a.status == "failed" and not a.resolved)
+                             for a in self.loops.values())
+            if actor.parent is not None or self._live_children(actor.id) or unresolved:
+                raise ValueError("only Main with all delegated responsibilities resolved may submit")
         output = self.invoke(name, args)
         fact = fingerprint([name, args, output])
         if fact not in actor.observed_facts:
@@ -666,25 +777,49 @@ class AdaptiveRuntime:
             return
         message = copy.deepcopy(response.message)
         actor.messages.append(message)
-        calls = message.get("tool_calls") or []
+        calls = message.get("tool_calls")
+        if calls is None:
+            calls = []
         required = list(actor.checkpoints) if required_checkpoints is None else required_checkpoints
-        if calls:
+        if calls or not isinstance(calls, list):
             try:
                 if response.finish_reason == "length":
                     raise ValueError("truncated tool batch; not executed")
-                parsed = [(c, c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls]
-                if any(not isinstance(args, dict) for _, _, args in parsed):
-                    raise ValueError("object arguments required")
+                parsed = parse_tool_calls(calls)
+                for _, name, args in parsed:
+                    if name not in self.validators:
+                        raise ValueError("unknown tool name")
+                    if name == "report_progress":
+                        continue  # optional ledger errors must not cancel business work
+                    errors = list(self.validators[name].iter_errors(args))
+                    if errors:
+                        error = errors[0]
+                        path = "/".join(str(p) for p in error.absolute_path) or "$"
+                        raise ValueError(f"{name}: invalid arguments at {path} ({error.validator})")
                 reports = [args for _, name, args in parsed if name == "report_progress"]
                 names = [name for _, name, _ in parsed]
+                if "load_tools" in names and any(name in self.tool_names for name in names):
+                    raise ValueError("load_tools exposes schemas next request; do not guess business calls in its batch")
                 if "collaborate" in names and (names.count("collaborate") > 1 or set(names) - {"collaborate", "report_progress"}):
                     raise ValueError("collaborate may only accompany report_progress")
                 if reports and "answer" in reports[0] and len(calls) != 1:
                     raise ValueError("a progress answer cannot accompany other tools")
             except (ValueError, KeyError, TypeError) as exc:
-                for call in calls:
-                    actor.messages.append({"role": "tool", "tool_call_id": call["id"],
-                        "content": json.dumps({"error": type(exc).__name__, "detail": str(exc)})})
+                ids = [c.get("id") for c in calls if isinstance(c, dict)] if isinstance(calls, list) else []
+                if (isinstance(calls, list) and len(ids) == len(calls) and
+                        all(isinstance(i, str) and i.strip() for i in ids) and len(set(ids)) == len(ids) and
+                        all(c.get("type") == "function" and isinstance(c.get("function"), dict) and
+                            isinstance(c["function"].get("name"), str) and c["function"]["name"].strip() and
+                            isinstance(c["function"].get("arguments"), str) for c in calls)):
+                    for call_id in ids:
+                        actor.messages.append({"role": "tool", "tool_call_id": call_id,
+                            "content": json.dumps({"error": type(exc).__name__, "detail": str(exc)})})
+                else:
+                    # An invalid wire envelope has no legal tool-call pairing. Keep
+                    # the original only in the trace, never send broken IDs onward.
+                    actor.messages.pop()
+                    actor.messages.append({"role": "user", "content":
+                        "Your last tool-call envelope was rejected and no tools ran: " + str(exc)})
                 self.emit("progress_protocol_error", agent=actor.id, error=str(exc))
                 return
             # Validate only the ledger write before tools. A bad optional report is
@@ -695,6 +830,9 @@ class AdaptiveRuntime:
                 try:
                     if len(reports) != 1:
                         raise ValueError("one local progress write per model response")
+                    errors = list(self.validators["report_progress"].iter_errors(reports[0]))
+                    if errors:
+                        raise ValueError(f"invalid progress report ({errors[0].validator})")
                     report_result = self._report_progress(actor, reports[0], request_version, required)
                 except (ValueError, KeyError, TypeError) as exc:
                     report_error = True

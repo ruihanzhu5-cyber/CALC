@@ -84,7 +84,8 @@ def main() -> int:
         "source_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in [ROOT / "src/calc/adaptive.py", ROOT / "src/calc/progress.py",
                       ROOT / "src/calc/benchmarks/appworld.py", ROOT / "src/calc/benchmarks/session.py",
-                      ROOT / "src/calc/llm.py", Path(__file__)]},
+                      ROOT / "src/calc/llm.py", ROOT / "src/calc/capabilities.py",
+                      ROOT / "src/calc/protocol.py", ROOT / "pyproject.toml", Path(__file__)]},
         "config": cfg, "runtime": options,
         "allowed_initial_operations": sorted(allowed_operations(mode, True, True)),
         "allowed_later_operations": sorted(allowed_operations(mode, False, True)),
@@ -118,7 +119,7 @@ def main() -> int:
                         result = runtime.run(adapter.instruction)
                 else:
                     observation = session.invoke("appworld_api", {"app": "api_docs",
-                        "api": "show_app_descriptions", "arguments_json": "{}"})
+                        "api": "show_app_descriptions", "arguments": {}})
                     if not observation.strip() or "Traceback" in observation:
                         raise RuntimeError("official documentation API preflight failed")
                     result = {"status": "preflight_only", "usage": {"model_requests": 0},

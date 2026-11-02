@@ -43,7 +43,8 @@ def main() -> int:
     root = Path(__file__).resolve().parents[1]
     manifest["calc_source_sha256"] = {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in
         ["src/calc/adaptive.py", "src/calc/progress.py", "src/calc/llm.py", "scripts/run_adaptive_workbench.py",
-         "src/calc/benchmarks/session.py", "src/calc/benchmarks/workbench.py"]}
+         "src/calc/benchmarks/session.py", "src/calc/benchmarks/workbench.py",
+         "src/calc/capabilities.py", "src/calc/protocol.py", "pyproject.toml"]}
     manifest["skills"] = cfg.get("skills", {})
     manifest["allowed_initial_operations"] = sorted(allowed_operations(mode, True, True))
     manifest["allowed_later_operations"] = sorted(allowed_operations(mode, False, True))

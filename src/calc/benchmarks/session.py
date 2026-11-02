@@ -23,6 +23,7 @@ class ActorEnvironment:
     invoke: ToolInvoker
     context: str
     events: Callable[[], list[dict]] | None
+    is_final_submission: Callable[[str, dict], bool] | None = None
 
 
 class EvaluationSession:
@@ -35,19 +36,22 @@ class EvaluationSession:
     def __init__(self, *, tools: list[dict], invoke: ToolInvoker, context: str,
                  evaluate: Callable[[str], Any], close: Callable[[], None] | None,
                  finish: Callable[[], None] | None = None,
-                 events: Callable[[], list[dict]] | None = None):
+                 events: Callable[[], list[dict]] | None = None,
+                 is_final_submission: Callable[[str, dict], bool] | None = None):
         names = [t['function']['name'] for t in tools]
         if len(names) != len(set(names)):
             raise ValueError('duplicate public tool names')
         self._tools, self._names = deepcopy(tools), frozenset(names)
         self._invoke, self._events = invoke, events
+        self._is_final_submission = is_final_submission
         self._evaluate, self._finish, self._close = evaluate, finish, close
         self._context, self._lock = context, RLock()
         self.phase = 'execute'
 
     def actor_environment(self) -> ActorEnvironment:
         return ActorEnvironment(deepcopy(self._tools), self.invoke, self._context,
-                                self.poll if self._events is not None else None)
+                                self.poll if self._events is not None else None,
+                                self._is_final_submission)
 
     def invoke(self, name: str, arguments: dict) -> Any:
         with self._lock:
@@ -101,4 +105,4 @@ def adaptive_runtime(environment: ActorEnvironment, *, strong, weak, options: di
     return AdaptiveRuntime(strong=strong, weak=weak, tools=environment.tools,
         invoke=environment.invoke, external_events=environment.events,
         environment_context=environment.context, event_sink=event_sink,
-        skills=skills, **options)
+        skills=skills, is_final_submission=environment.is_final_submission, **options)

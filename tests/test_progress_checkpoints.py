@@ -61,7 +61,7 @@ def assessed(*calls, decision='continue', answer=None, **extra):
 
 def runtime(strong=(), weak=(), **kw):
     return AdaptiveRuntime(strong=Scripted(strong), weak=Scripted(weak),
-        tools=[function('read', 'read objects', {}, [])], invoke=kw.pop('invoke', lambda n, a: {'value': 1}), **kw)
+        tools=[function('read', 'read objects', {'owner': {'type': 'string'}}, [])], invoke=kw.pop('invoke', lambda n, a: {'value': 1}), **kw)
 
 
 def test_trivial_task_assesses_and_answers_in_one_normal_request():
@@ -138,7 +138,7 @@ def test_progress_reporting_is_independent_and_ordinary_updates_do_not_wake_pare
     assert parent.status == 'ready' and parent.notices[-1]['type'] == 'blocked'
 
 
-def test_subgoal_dependency_change_assessed_without_changing_topology():
+def test_subgoal_dependency_change_is_presented_without_forcing_topology():
     rt = runtime()
     main = rt._new('task', None, 'strong', [])
     goals = [{'id': 'a', 'goal': 'read A', 'status': 'open', 'dependencies': []},
@@ -146,7 +146,11 @@ def test_subgoal_dependency_change_assessed_without_changing_topology():
     rt._report_progress(main, report_args(main, subgoals=goals))
     goals[1]['dependencies'] = []
     rt._report_progress(main, report_args(main, subgoals=goals))
-    assert len(rt.loops) == 1 and main.checkpoints == {}
+    assert len(rt.loops) == 1
+    assert [c['type'] for c in main.checkpoints.values()] == ['plan_changed']
+    assert 'plan_changed' in rt._messages(main)[0]['content']
+    rt._accept(main, batch(('read', {})), None, [], list(main.checkpoints))
+    assert main.checkpoints == {}
     assert len([e for e in rt.events if e['event'] == 'progress_checkpoint' and e['checkpoint']['type'] == 'plan_changed']) == 2
 
 

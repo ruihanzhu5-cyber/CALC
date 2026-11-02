@@ -202,7 +202,8 @@ class Gaia2Adapter:
 
     def session(self) -> EvaluationSession:
         return EvaluationSession(tools=self.tools, invoke=self.invoke, context=PUBLIC_CONTEXT,
-            events=self.pending, evaluate=lambda answer: self.evaluate(), close=self.close)
+            events=self.pending, evaluate=lambda answer: self.evaluate(), close=self.close,
+            is_final_submission=lambda name, args: name == "AgentUserInterface__send_message_to_user")
 
 
 class ClockedClient:
