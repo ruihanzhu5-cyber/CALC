@@ -23,10 +23,16 @@ def decision_tools(collaborate: dict) -> tuple[dict, dict]:
     proposal = copy.deepcopy(collaborate['function']['parameters'])
     # These fields are compiled from the immutable decision snapshot, rather than
     # asking a model to repeat or overwrite observed state in a second envelope.
-    for key in ('progress_ref', 'event_type', 'event_version', 'progress', 'evidence_ids', 'baseline_next'):
+    for key in ('progress_ref', 'event_type', 'event_version', 'progress', 'evidence_ids', 'baseline_next',
+                'reason', 'proposed_next'):
         proposal['properties'].pop(key)
     proposal['properties']['operation']['enum'] = ['delegate', 'merge', 'fold', 'escalate', 'respond']
-    proposal['required'] = ['operation', 'reason', 'proposed_next', 'expected_savings', 'risks', 'handoff']
+    proposal['required'] = ['operation', 'expected_savings', 'risks', 'handoff']
+    # Source-family bindings are compiler-owned; branch evidence defaults to the
+    # validated owner snapshot. Do not ask a model to invent opaque references.
+    branch = proposal['properties']['branches']['items']['properties']
+    branch.pop('source_family')
+    branch.pop('evidence_ids')
     recovery = {'type': 'object', 'additionalProperties': False,
                 'properties': {'goal': {'type': 'string', 'minLength': 1},
                                'tool': {'type': 'string', 'minLength': 1}}, 'required': ['goal', 'tool']}
@@ -62,6 +68,28 @@ def decision_tools(collaborate: dict) -> tuple[dict, dict]:
                            'recovery_step': recovery},
             'required': ['commit', 'reason']}}}
     return decide, confirm
+
+
+def scoped_decision_tool(runtime, actor, state: dict) -> dict:
+    """Expose real capability names in the proposal schema, not environment labels."""
+    tool = copy.deepcopy(runtime.decide_tool)
+    properties = tool['function']['parameters']['properties']
+    branch = properties['proposal']['properties']['branches']['items']['properties']
+    def names(schema, available):
+        if available:
+            schema['items']['enum'] = list(available)
+        else:
+            schema['maxItems'] = 0
+    names(branch['tools'], actor.allowed_tools)
+    branch['tools']['description'] = 'Registered business tool names only; omit to inherit parent scope.'
+    names(branch['skills'], runtime.skills)
+    branch['skills']['description'] = 'Registered skill names only; omit if no existing skill is needed.'
+    names(properties['covered_work_ids'], [u['work_id'] for u in state['work']])
+    names(properties['dependencies'], [a.id for a in runtime._live_children(actor.id)])
+    proposal = properties['proposal']['properties']
+    names(proposal['sources'], runtime.loops)
+    proposal['receiver']['enum'] = list(runtime.loops)
+    return tool
 
 
 def snapshot(runtime, actor) -> dict:
@@ -110,7 +138,8 @@ def normalize_candidate(actor, state: dict, decision: dict) -> dict:
         raise ValueError('operation disabled by experimental configuration')
     event_type = next((e['type'] for e in state['events']
                        if e['type'] in {'task_start', 'blocked', 'conflict', 'overlap', 'dependency_changed'}), 'progress')
-    return {**proposal, 'event_type': event_type, 'event_version': actor.version,
+    return {**proposal, 'reason': decision['reason'], 'proposed_next': decision['next_work'],
+            'event_type': event_type, 'event_version': actor.version,
             'progress': asdict(actor.work), 'evidence_ids': list(state['evidence_ids']),
             'baseline_next': actor.work.next_step}
 

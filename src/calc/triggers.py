@@ -145,4 +145,9 @@ def control_messages(runtime, actor, state: dict) -> list[dict]:
         {'role': 'user', 'content': json.dumps({'original_task': actor.goal, 'work': state['work'],
             'events': state['events'], 'evidence_metadata': cards,
             'allowed_operations': state['allowed_operations'], 'read_sources': list(actor.read_sources.values()),
+            'business_capabilities': runtime.registry.scoped(actor.allowed_tools).catalog(),
+            'registered_skills': list(runtime.skills),
+            'binding_rule': 'Branch tools are registered capability names, not underlying API/operation labels. '
+                            'Omit tools to inherit scope; omit skills when none is registered. '
+                            'Source-family IDs and evidence bindings belong to the runtime compiler.',
             'output_pressure': actor.output_pressure}, ensure_ascii=False)}]

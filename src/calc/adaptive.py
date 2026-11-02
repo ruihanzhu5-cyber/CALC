@@ -19,7 +19,7 @@ from jsonschema import Draft202012Validator
 from calc.llm import aggregate_usage
 from calc.capabilities import ToolRegistry
 from calc.protocol import parse_tool_calls
-from calc.scheduling import (decision_tools, snapshot, assert_current, normalize_candidate,
+from calc.scheduling import (decision_tools, scoped_decision_tool, snapshot, assert_current, normalize_candidate,
                              preview, cost_panel, StaleDecisionError)
 from calc.triggers import tool_traits as describe_tool, observe_source, compile_candidate, control_messages
 from calc.progress import (WorkReport, MODES, EVENT_TYPES, OPERATIONS, allowed_operations,
@@ -372,7 +372,7 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             if self.compiled_triggers:
                 messages = control_messages(self, actor, scheduling_state)
             committing = actor.scheduling_candidate is not None
-            tools = [self._commit_schema(actor) if committing else self.decide_tool]
+            tools = [self._commit_schema(actor) if committing else scoped_decision_tool(self, actor, scheduling_state)]
             body = actor.scheduling_candidate if committing else scheduling_state
             messages.append({"role": "user", "content":
                 ("COMMIT STAGE. Inspect all same-work alternatives and their compiled costs. "
@@ -389,7 +389,10 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                  "Read the task and observations to identify new dependencies or independent goals; "
                  "a prior report_progress is NOT required. Preserve unfinished objectives and completion "
                  "conditions; role differences or collection size alone do not justify delegation. "
-                 "Use next_work to state who does what next. Defer only to live direct children. "
+                 "Use next_work ONCE to state who does what next (after the operation for a candidate). "
+                 "Proposal reason and proposed_next are bound from the outer reason and next_work, not repeated. "
+                 "Branch tools/skills use the registered names in their enums; omit them to inherit tools/use no skills. "
+                 "Do not invent source-family bindings or branch evidence lists. Defer only to live direct children. "
                  "Do not create teams for easy work, but do not keep serial work merely because the current "
                  "loop can eventually do it: consider genuinely independent goals, context isolation and "
                  "required verification. No business tools or answer in this stage.\n") +
@@ -456,7 +459,7 @@ Do not report or delegate just to demonstrate activity. New observations can jus
             if response.finish_reason != "tool_calls":
                 raise ValueError("decision must be a complete native tool call")
             calls = parse_tool_calls(response.message.get("tool_calls"))
-            tool = self._commit_schema(actor) if committing else self.decide_tool
+            tool = self._commit_schema(actor) if committing else scoped_decision_tool(self, actor, state)
             if len(calls) != 1 or calls[0][1] != tool['function']['name']:
                 raise ValueError("one decision call and no business actions required")
             call, _, data = calls[0]

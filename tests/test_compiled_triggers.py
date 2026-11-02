@@ -231,6 +231,8 @@ def test_compact_controller_sees_operations_not_authentication_or_raw_output():
     assert 'synthetic-private' not in json.dumps(messages)
     assert 'raw-only' not in json.dumps(messages)
     assert payload['work'][0]['progress_report_stale'] is True
+    assert {entry['name'] for entry in payload['business_capabilities']}=={'north','south','save'}
+    assert payload['registered_skills']==[]
 
 
 def test_appworld_traits_use_public_method_not_name_and_preserve_account_identity():

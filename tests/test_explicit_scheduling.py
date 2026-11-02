@@ -7,7 +7,7 @@ import pytest
 
 from calc.adaptive import AdaptiveRuntime, function
 from calc.llm import ChatResponse, Usage
-from calc.scheduling import snapshot, preview, cost_panel
+from calc.scheduling import snapshot, preview, cost_panel, scoped_decision_tool
 
 
 def native(name, arguments, finish='tool_calls'):
@@ -23,6 +23,8 @@ def keep(state, **changes):
             **changes}
     if fields['decision'] == 'candidate' and 'covered_work_ids' not in fields:
         fields['covered_work_ids'] = [w['work_id'] for w in state['work']]
+    if fields['decision'] == 'candidate' and 'proposal' in fields:
+        fields['proposal'] = {k:v for k,v in fields['proposal'].items() if k not in {'reason','proposed_next'}}
     return fields
 
 
@@ -347,3 +349,47 @@ def test_candidate_binds_real_snapshot_evidence_without_echo_or_environment_call
     rt._accept_decision(main,native('decide_collaboration',data),None,state)
     assert main.scheduling_candidate['proposal']['evidence_ids']==['e0']
     assert len(rt.archive)==1 and set(rt.loops)=={'main'}
+
+
+def test_candidate_next_work_has_one_authoritative_model_field():
+    rt=runtime()
+    main=rt._new('task',None,'strong',[])
+    state=snapshot(rt,main)
+    schema=scoped_decision_tool(rt,main,state)['function']['parameters']['properties']['proposal']
+    assert 'reason' not in schema['properties'] and 'proposed_next' not in schema['properties']
+    data=keep(state,decision='candidate',next_work='Reader checks source, parent joins results',
+              proposal=compact(pattern='parallel',branches=[{'goal':'inspect source'}]))
+    rt._accept_decision(main,native('decide_collaboration',data),None,state)
+    proposal=main.scheduling_candidate['proposal']
+    assert proposal['proposed_next']==data['next_work']
+    assert proposal['reason']==data['reason']
+
+
+@pytest.mark.parametrize('field,bad_name',[('tools','inventory.list_records'),('skills','imagined_skill')])
+def test_backend_labels_and_invented_skills_are_not_capability_identifiers(field,bad_name):
+    rt=runtime(tools=[function('backend_call','Invoke a backend API using JSON arguments',{},[])],
+               skills={'inspect':{'body':'Inspect public evidence'}})
+    main=rt._new('task',None,'strong',[])
+    state=snapshot(rt,main)
+    schema=scoped_decision_tool(rt,main,state)['function']['parameters']['properties']['proposal']
+    branch=schema['properties']['branches']['items']['properties']
+    assert branch['tools']['items']['enum']==['backend_call']
+    assert branch['skills']['items']['enum']==['inspect']
+    assert 'source_family' not in branch and 'evidence_ids' not in branch
+    data=keep(state,decision='candidate',proposal=compact(pattern='parallel',
+        branches=[{'goal':'read a source',field:[bad_name]}]))
+    rt._accept_decision(main,native('decide_collaboration',data),None,state)
+    assert main.status=='failed' and set(rt.loops)=={'main'}
+    assert any(e['event']=='scheduling_error' and 'decision schema' in e['detail'] for e in rt.events)
+
+
+def test_valid_registered_capability_reaches_real_preview_without_alias_repair():
+    rt=runtime(tools=[function('backend_call','Invoke a backend API using JSON arguments',{},[])])
+    main=rt._new('task',None,'strong',[])
+    state=snapshot(rt,main)
+    data=keep(state,decision='candidate',proposal=compact(pattern='parallel',
+        branches=[{'goal':'read source','tools':['backend_call'],'skills':[]}]))
+    rt._accept_decision(main,native('decide_collaboration',data),None,state)
+    assert main.status=='ready' and main.scheduling_candidate
+    assert main.scheduling_candidate['proposal']['branches'][0]['tools']==['backend_call']
+    assert rt.archive=={} and set(rt.loops)=={'main'}
