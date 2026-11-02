@@ -18,9 +18,9 @@ from jsonschema import Draft202012Validator
 
 from calc.llm import aggregate_usage
 from calc.capabilities import ToolRegistry
-from calc.protocol import parse_tool_calls
+from calc.protocol import parse_tool_calls, error_messages
 from calc.scheduling import (decision_tools, scoped_decision_tool, snapshot, assert_current, normalize_candidate,
-                             preview, cost_panel, StaleDecisionError)
+                             preview, cost_panel, StaleDecisionError, DecisionRejected, schema_issues)
 from calc.triggers import tool_traits as describe_tool, observe_source, compile_candidate, control_messages
 from calc.progress import (WorkReport, MODES, EVENT_TYPES, OPERATIONS, allowed_operations,
                            fingerprint, validate_proposal, collection_facts, validate_subgoals)
@@ -185,6 +185,7 @@ class Loop:
     scheduling_candidate: dict | None = None
     scheduling_suggestion: dict | None = None
     scheduling_wait: dict[str, list] = field(default_factory=dict)
+    scheduling_feedback: dict | None = None
     first_observation: bool = False
     read_only: bool = False
     source_family: str | None = None
@@ -453,24 +454,29 @@ Do not report or delegate just to demonstrate activity. New observations can jus
         self.emit("scheduling_response", agent=actor.id, purpose=purpose,
                   message=response.message if response else None,
                   finish_reason=response.finish_reason if response else None)
+        def acknowledge():
+            # Pair the validated real call before a transition archives history.
+            actor.messages.append(copy.deepcopy(response.message))
+            actor.messages.append({'role': 'tool', 'tool_call_id': call['id'],
+                                   'content': json.dumps({'decision_validated': True})})
+            actor.scheduling_feedback = None
         try:
             if error:
                 raise RuntimeError(error)
             if response.finish_reason != "tool_calls":
-                raise ValueError("decision must be a complete native tool call")
-            calls = parse_tool_calls(response.message.get("tool_calls"))
+                raise DecisionRejected('incomplete_control_call', [{'detail': 'Use one complete native decision call'}])
+            try:
+                calls = parse_tool_calls(response.message.get("tool_calls"))
+            except ValueError as exc:
+                raise DecisionRejected('invalid_control_arguments', [{'detail': str(exc)}]) from None
             tool = self._commit_schema(actor) if committing else scoped_decision_tool(self, actor, state)
             if len(calls) != 1 or calls[0][1] != tool['function']['name']:
-                raise ValueError("one decision call and no business actions required")
+                raise DecisionRejected('wrong_control_batch', [{'detail': 'One decision call and no business actions required'}])
             call, _, data = calls[0]
             errors = list(Draft202012Validator(tool['function']['parameters']).iter_errors(data))
             if errors:
-                raise ValueError('decision schema: ' + errors[0].message)
+                raise DecisionRejected('decision_schema', schema_issues(errors))
             assert_current(self, actor, state)
-            # Complete the real call protocol before a transition archives history.
-            actor.messages.append(copy.deepcopy(response.message))
-            actor.messages.append({'role': 'tool', 'tool_call_id': call['id'],
-                                   'content': json.dumps({'decision_received': True})})
             if committing:
                 item = actor.scheduling_candidate
                 if 'alternatives' in item:
@@ -481,12 +487,19 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                     commit, chosen = data['commit'], item['proposal']
                 if commit:
                     if 'recovery_step' in data:
-                        raise ValueError('choose committed reorganization or inline recovery, not both')
+                        raise DecisionRejected('conflicting_actions', [{'detail': 'Choose reorganization or inline recovery'}])
+                    try:
+                        preview(self, actor.id, chosen)
+                    except (ValueError, KeyError, TypeError) as exc:
+                        raise DecisionRejected('candidate_not_executable', [{'detail': str(exc)}]) from None
+                    acknowledge()
                     outcome = self.change(actor.id, chosen)
                     actor.output_pressure = None
                     actor.recovery_step = None
                     selected = 'commit'
                 else:
+                    self._validate_recovery(actor, data)
+                    acknowledge()
                     self._select_recovery(actor, data)
                     outcome, selected = {'continue_original_session': True}, 'keep'
                 actor.scheduling_candidate = None
@@ -498,17 +511,21 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                 actor.messages.append({'role': 'user', 'content': 'Scheduling outcome: ' + json.dumps(outcome)})
                 return
             if data['decision'] == 'candidate' and set(data['covered_work_ids']) != {u['work_id'] for u in state['work']}:
-                raise ValueError('candidate/keep must cover the same unfinished work IDs')
+                raise DecisionRejected('work_coverage', [{'detail': 'Candidate must cover the same unfinished work IDs'}])
             choice = data['decision']
             if choice == 'candidate':
                 if 'recovery_step' in data:
-                    raise ValueError('candidate and recovery_step are separate alternatives')
-                proposal = normalize_candidate(actor, state, data)
+                    raise DecisionRejected('conflicting_actions', [{'detail': 'Candidate and recovery_step are separate alternatives'}])
+                try:
+                    proposal = normalize_candidate(actor, state, data)
+                    shadow = preview(self, actor.id, proposal)
+                except (ValueError, KeyError, TypeError) as exc:
+                    raise DecisionRejected('candidate_not_executable', [{'detail': str(exc)}]) from None
                 signature = fingerprint([actor.id, proposal, state['versions'], actor.observed_facts])
                 if signature in self.seen_schedule_candidates:
-                    raise ValueError('same proposal without new work or evidence')
-                shadow = preview(self, actor.id, proposal)
+                    raise DecisionRejected('duplicate_candidate', [{'detail': 'No new work or evidence supports this repeated proposal'}])
                 panel = cost_panel(self, shadow, state)
+                acknowledge()
                 self.seen_schedule_candidates.add(signature)
                 actor.scheduling_candidate = {'snapshot_id': state['snapshot_id'], 'state': state,
                                               'proposal': proposal, 'cost_panel': panel}
@@ -516,19 +533,22 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                           covered_work_ids=data['covered_work_ids'], proposal=proposal, cost_panel=panel)
                 return
             if any(r['parent'] == actor.id and r['status'] == 'pending' for r in self.requests.values()):
-                raise ValueError('decide pending child requests before keep/defer')
+                raise DecisionRejected('pending_child_request', [{'detail': 'Respond to pending child requests before keep/defer'}])
             if choice == 'defer':
                 if actor.output_pressure is not None or 'recovery_step' in data:
-                    raise ValueError('output pressure requires a concrete recovery step or reorganization')
+                    raise DecisionRejected('invalid_defer', [{'detail': 'Output pressure requires a bounded step or reorganization'}])
                 children = {a.id: a for a in self._live_children(actor.id)}
                 if any(d not in children for d in data['dependencies']):
-                    raise ValueError('defer requires live direct-child dependencies')
+                    raise DecisionRejected('invalid_defer', [{'detail': 'Defer requires live direct children'}])
                 if any(children[d].status == 'review' for d in data['dependencies']):
-                    raise ValueError('cannot defer to a child waiting for your approval')
+                    raise DecisionRejected('invalid_defer', [{'detail': 'Child is waiting for your approval'}])
+                acknowledge()
                 actor.scheduling_wait = {d: [children[d].status, children[d].resolved]
                                          for d in data['dependencies']}
                 actor.status = 'waiting'
             else:
+                self._validate_recovery(actor, data)
+                acknowledge()
                 self._select_recovery(actor, data)
                 actor.scheduling_wait = {}
             actor.work.next_step = data['next_work']
@@ -548,6 +568,18 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                 actor.status = 'ready'
                 self._checkpoint(actor, 'decision_invalidated', fingerprint(snapshot(self, actor)),
                                  {'previous_snapshot': state['snapshot_id']})
+        except DecisionRejected as exc:
+            feedback = {'status': 'error', 'error': exc.code, 'issues': exc.issues,
+                        'organization_changed': False, 'actions_executed': False,
+                        'next': 'Continue your original work, or explicitly propose a corrected operation. '
+                                'No keep decision or automatic retry was accepted.'}
+            actor.messages.extend(error_messages(copy.deepcopy(response.message), feedback))
+            actor.scheduling_feedback = feedback
+            actor.scheduling_candidate = None
+            actor.scheduling_suggestion = None
+            actor.scheduling_wait = {}
+            self._consume_checkpoints(actor, state['event_ids'], meaning='Rejected proposal observed; no choice accepted')
+            self.emit('scheduling_rejected', agent=actor.id, purpose=purpose, **feedback)
         except Exception as exc:
             actor.status = 'failed'
             actor.version += 1
@@ -555,16 +587,22 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                       error=type(exc).__name__, detail=str(exc))
             self._notice(actor.parent, 'failed', actor, {'reason': 'scheduling_error', 'work': asdict(actor.work)})
 
-    def _select_recovery(self, actor: Loop, data: dict) -> None:
+    def _validate_recovery(self, actor: Loop, data: dict) -> None:
         if actor.output_pressure is None:
             if 'recovery_step' in data:
-                raise ValueError('recovery_step is only valid for actual output pressure')
+                raise DecisionRejected('invalid_recovery', [{'detail': 'No actual output pressure exists'}])
             return
         if 'recovery_step' not in data:
-            raise ValueError('keep after output exhaustion requires a bounded recovery_step')
+            raise DecisionRejected('invalid_recovery', [{'detail': 'Output pressure requires a bounded recovery_step'}])
         step = data['recovery_step']
         if step['tool'] not in actor.loaded_tools or step['tool'] not in self.tool_names:
-            raise ValueError('recovery must select an already-loaded business tool')
+            raise DecisionRejected('invalid_recovery', [{'detail': 'Select an already-loaded business tool'}])
+
+    def _select_recovery(self, actor: Loop, data: dict) -> None:
+        self._validate_recovery(actor, data)
+        if actor.output_pressure is None:
+            return
+        step = data['recovery_step']
         actor.recovery_step = copy.deepcopy(step)
         actor.messages.append({'role': 'user', 'content': 'Output pressure recovery. Execute one bounded step: ' + json.dumps(step)})
         self.emit('recovery_step_selected', agent=actor.id, step=step)
@@ -718,12 +756,12 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                 self._checkpoint(actor, notice["type"], notice["id"], notice)
         self.emit("events_delivered", agent=actor.id, event_ids=[n["id"] for n in notices])
 
-    def _consume_checkpoints(self, actor: Loop, ids: list[str]) -> None:
+    def _consume_checkpoints(self, actor: Loop, ids: list[str], *, meaning: str | None = None) -> None:
         consumed = [cid for cid in ids if actor.checkpoints.pop(cid, None) is not None]
         if consumed:
             self.emit("checkpoint_consumed", agent=actor.id, checkpoint_ids=consumed,
-                      meaning="Explicit scheduling choice" if self.scheduling == "explicit" else
-                              "Observed by a normal decision; no organization change implied")
+                      meaning=meaning or ("Explicit scheduling choice" if self.scheduling == "explicit" else
+                              "Observed by a normal decision; no organization change implied"))
 
     def change(self, actor_id: str, p: dict) -> dict:
         actor = self.loops[actor_id]
@@ -1148,21 +1186,9 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                 if reports and "answer" in reports[0] and len(calls) != 1:
                     raise ValueError("a progress answer cannot accompany other tools")
             except (ValueError, KeyError, TypeError) as exc:
-                ids = [c.get("id") for c in calls if isinstance(c, dict)] if isinstance(calls, list) else []
-                if (isinstance(calls, list) and len(ids) == len(calls) and
-                        all(isinstance(i, str) and i.strip() for i in ids) and len(set(ids)) == len(ids) and
-                        all(c.get("type") == "function" and isinstance(c.get("function"), dict) and
-                            isinstance(c["function"].get("name"), str) and c["function"]["name"].strip() and
-                            isinstance(c["function"].get("arguments"), str) for c in calls)):
-                    for call_id in ids:
-                        actor.messages.append({"role": "tool", "tool_call_id": call_id,
-                            "content": json.dumps({"error": type(exc).__name__, "detail": str(exc)})})
-                else:
-                    # An invalid wire envelope has no legal tool-call pairing. Keep
-                    # the original only in the trace, never send broken IDs onward.
-                    actor.messages.pop()
-                    actor.messages.append({"role": "user", "content":
-                        "Your last tool-call envelope was rejected and no tools ran: " + str(exc)})
+                actor.messages.pop()
+                actor.messages.extend(error_messages(message, {
+                    'status': 'error', 'error': type(exc).__name__, 'detail': str(exc), 'actions_executed': False}))
                 self.emit("progress_protocol_error", agent=actor.id, error=str(exc))
                 return
             # Validate only the ledger write before tools. A bad optional report is
@@ -1382,6 +1408,7 @@ Do not report or delegate just to demonstrate activity. New observations can jus
                             "explicit_keep_decisions": sum(e['event'] == 'scheduling_result' and e['decision'] == 'keep'
                                                            for e in self.events),
                             "scheduling_errors": sum(e['event'] == 'scheduling_error' for e in self.events),
+                            "scheduling_rejections": sum(e['event'] == 'scheduling_rejected' for e in self.events),
                             "compiled_trigger_count": sum(e['event'] == 'trigger_fired' for e in self.events),
                             "output_pressure_count": sum(e['event'] == 'execution_output_truncated' for e in self.events),
                             "recovery_steps_completed": sum(e['event'] == 'recovery_step_completed' for e in self.events),

@@ -1,5 +1,7 @@
 # 候选先编译，再由模型比较
 
+后续错误处理与真实环境集成检查见[RECOVERABLE_COLLABORATION_PROTOCOL.md](RECOVERABLE_COLLABORATION_PROTOCOL.md)。本文保留各阶段的测试和实验版本说明，不将新修订解释成旧轨迹已经成功。
+
 ## 修复目标与边界
 
 起点为 `3870faba753a140e9984aa151b348b6d779e9055`，新分支 `feat/compiled-collaboration-triggers`。保留旧实验、冻结配置和 V0 路径；实际入口仍是 AdaptiveRuntime。

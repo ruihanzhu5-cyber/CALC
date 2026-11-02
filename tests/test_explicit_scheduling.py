@@ -107,17 +107,22 @@ def test_collection_events_are_merged_and_do_not_require_progress_report():
     lambda d: d.update(decision='unknown'),
     lambda d: d.update(extra_field=True),
 ])
-def test_invalid_decision_fails_visibly_without_automatic_keep(mutate):
+def test_invalid_decision_returns_error_and_original_execution_continues_without_automatic_keep(mutate):
     def bad(s):
         data = keep(s)
         mutate(data)
         return data
-    c = Client(lambda m: pytest.fail('Business tools must not run'), decide=bad)
+    c = Client(lambda m: answer(), decide=bad)
     result = runtime(c).run('Task')
-    assert result['status'] == 'blocked_or_failed'
-    assert result['metrics']['scheduling_errors'] == 1
+    assert result['status'] == 'answered'
+    assert result['metrics']['scheduling_errors'] == 0
+    assert result['metrics']['scheduling_rejections'] == 1
     assert result['metrics']['explicit_keep_decisions'] == 0
-    assert result['usage']['model_requests'] == 1
+    assert result['usage']['model_requests'] == 2
+    assert result['metrics']['scheduling_decision_calls'] == 1
+    assert len(result['loops']) == 1
+    assert any(m['role']=='tool' and json.loads(m['content']).get('status')=='error'
+               for m in c.requests[-1][0])
 
 
 @pytest.mark.parametrize('arguments,finish', [('{"decision":', 'length'),
@@ -128,7 +133,7 @@ def test_truncation_and_duplicate_keys_do_not_repair_or_execute(arguments, finis
     msg = native('decide_collaboration', {}).message
     msg['tool_calls'][0]['function']['arguments'] = arguments
     rt._accept_decision(main, ChatResponse(msg, finish, Usage(), 0), None, snapshot(rt, main))
-    assert main.status == 'failed'
+    assert main.status == 'ready'
     assert len(rt.calls) == 1 and rt.calls[0]['usage']['reported'] is False
     assert not any(e['event'] == 'scheduling_result' for e in rt.events)
 
@@ -195,7 +200,8 @@ def test_defer_cannot_self_deadlock(dependency):
     rt = runtime()
     main = rt._new('main', None, 'strong', [])
     stage(rt, main, {'decision': 'defer', 'dependencies': [dependency]})
-    assert main.status == 'failed'
+    assert main.status == 'ready' and not main.scheduling_wait
+    assert any(e['event']=='scheduling_rejected' for e in rt.events)
 
 
 def test_changed_owner_epoch_invalidates_candidate_without_transition():
@@ -239,7 +245,9 @@ def test_preview_isolation_and_operation_mask():
     state = stage(rt, main, {'decision': 'candidate', 'proposal': compact(
         'fold', sources=[child.id], receiver=main.id)})
     assert 'fold' not in state['allowed_operations']
-    assert child.status == 'ready' and main.status == 'failed'
+    assert child.status == 'ready' and main.status == 'ready'
+    assert child.transferred_to is None
+    assert any(e['event']=='scheduling_rejected' for e in rt.events)
 
 
 def test_missing_frontier_units_cannot_be_saved_by_a_cheaper_candidate():
@@ -248,7 +256,9 @@ def test_missing_frontier_units_cannot_be_saved_by_a_cheaper_candidate():
     child = rt._new('hard task', main.id, 'weak', [])
     stage(rt, main, {'decision': 'candidate', 'covered_work_ids': ['scope:main'],
                      'proposal': compact('fold', sources=[child.id], receiver=main.id)})
-    assert main.status == 'failed' and child.status == 'ready'
+    assert main.status == 'ready' and child.status == 'ready'
+    assert child.transferred_to is None
+    assert any(e['event']=='scheduling_rejected' for e in rt.events)
 
 
 def test_normal_solver_suggestion_enters_same_decision_gateway():
@@ -335,8 +345,8 @@ def test_decision_protocol_has_no_model_generated_evidence_identity():
     # This is the actual class of failed pilot response, not an ID to repair.
     bad = keep(state, evidence_ids=[state['event_ids'][0]])
     rt._accept_decision(main, native('decide_collaboration', bad), None, state)
-    assert main.status == 'failed'
-    assert any(e['event']=='scheduling_error' and 'Additional properties' in e['detail'] for e in rt.events)
+    assert main.status == 'ready'
+    assert any(e['event']=='scheduling_rejected' and e['error']=='decision_schema' for e in rt.events)
 
 
 def test_candidate_binds_real_snapshot_evidence_without_echo_or_environment_call():
@@ -379,8 +389,8 @@ def test_backend_labels_and_invented_skills_are_not_capability_identifiers(field
     data=keep(state,decision='candidate',proposal=compact(pattern='parallel',
         branches=[{'goal':'read a source',field:[bad_name]}]))
     rt._accept_decision(main,native('decide_collaboration',data),None,state)
-    assert main.status=='failed' and set(rt.loops)=={'main'}
-    assert any(e['event']=='scheduling_error' and 'decision schema' in e['detail'] for e in rt.events)
+    assert main.status=='ready' and set(rt.loops)=={'main'}
+    assert any(e['event']=='scheduling_rejected' and e['error']=='decision_schema' for e in rt.events)
 
 
 def test_valid_registered_capability_reaches_real_preview_without_alias_repair():

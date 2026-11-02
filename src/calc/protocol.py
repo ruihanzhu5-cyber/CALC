@@ -84,3 +84,24 @@ def parse_tool_calls(calls: list[dict[str, Any]]) -> list[tuple[dict[str, Any], 
             raise ValueError(prefix + 'arguments JSON must be an object')
         parsed.append((call, name, args))
     return parsed
+
+
+def error_messages(message: dict, feedback: dict) -> list[dict]:
+    """Pair rejected native calls without parsing, repairing, or running arguments.
+
+    Invalid envelopes cannot be replayed into a provider conversation. Their raw
+    responses belong in the trace; return an ordinary user notification instead.
+    Design reference: Anthropic loop-kit _result / LangGraph ToolNode errors.
+    """
+    calls = message.get('tool_calls')
+    if isinstance(calls, list) and calls:
+        ids = [c.get('id') for c in calls if isinstance(c, dict)]
+        if (len(ids) == len(calls) and all(isinstance(i, str) and i.strip() for i in ids)
+                and len(set(ids)) == len(ids) and all(
+                    c.get('type') == 'function' and isinstance(c.get('function'), dict)
+                    and isinstance(c['function'].get('name'), str) and c['function']['name'].strip()
+                    and isinstance(c['function'].get('arguments'), str) for c in calls)):
+            return [message, *[{'role': 'tool', 'tool_call_id': identity,
+                                'content': json.dumps(feedback, ensure_ascii=False)} for identity in ids]]
+    return [{'role': 'user', 'content': 'Rejected model request; no action ran. ' +
+             json.dumps(feedback, ensure_ascii=False)}]

@@ -1,5 +1,7 @@
 # 通用接口、Benchmark 适配与 Mock 的边界
 
+版本说明：本文记录2536629及之前的缺陷与诊断。后续已实现参数错误反馈和原会话保留，见[RECOVERABLE_COLLABORATION_PROTOCOL.md](RECOVERABLE_COLLABORATION_PROTOCOL.md)；下文“当前错误会终止loop”等为该历史版本状态。
+
 ## 本轮事实
 
 2ed9ff9 原三题：WorkBench 正常通过；两道 AppWorld 在初始调度把 checkpoint 填入 evidence_ids，未执行业务工具。90f9a35 取消模型回传证据，用户授权额外补跑两道 AppWorld。

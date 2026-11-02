@@ -19,6 +19,30 @@ class StaleDecisionError(ValueError):
     """An observed state change invalidated a plan, not an action to execute."""
 
 
+class DecisionRejected(ValueError):
+    """A model-facing contract rejection, separate from an internal runtime error."""
+    def __init__(self, code: str, issues: list[dict]):
+        super().__init__(code)
+        self.code, self.issues = code, issues
+
+
+def schema_issues(errors) -> list[dict]:
+    """Describe repairs without copying argument values or authentication data."""
+    result = []
+    for error in errors:
+        item = {'path': list(error.absolute_path), 'constraint': error.validator}
+        if error.validator == 'required':
+            item['missing'] = [k for k in error.validator_value if k not in error.instance]
+        elif error.validator == 'enum':
+            item['allowed'] = error.validator_value
+        elif error.validator == 'additionalProperties':
+            item['allowed_fields'] = list(error.schema.get('properties', {}))
+        elif error.validator == 'type':
+            item['expected_type'] = error.validator_value
+        result.append(item)
+    return result
+
+
 def decision_tools(collaborate: dict) -> tuple[dict, dict]:
     proposal = copy.deepcopy(collaborate['function']['parameters'])
     # These fields are compiled from the immutable decision snapshot, rather than
@@ -84,6 +108,10 @@ def scoped_decision_tool(runtime, actor, state: dict) -> dict:
     branch['tools']['description'] = 'Registered business tool names only; omit to inherit parent scope.'
     names(branch['skills'], runtime.skills)
     branch['skills']['description'] = 'Registered skill names only; omit if no existing skill is needed.'
+    branch['read_only']['description'] = (
+        'True forbids ALL writes/unknown effects, including setup/authentication. '
+        'Use only if required access setup is complete and seed context is handed over. '
+        'Omit to inherit ordinary parent permissions; cannot widen a read-only parent.')
     names(properties['covered_work_ids'], [u['work_id'] for u in state['work']])
     names(properties['dependencies'], [a.id for a in runtime._live_children(actor.id)])
     proposal = properties['proposal']['properties']

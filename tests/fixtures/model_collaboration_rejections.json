@@ -1,0 +1,144 @@
+[
+  {
+    "kind": "unknown_capability",
+    "source_commit": "90f9a35",
+    "source_trace_sha256": "b18da1a9bdd48227b0120cbcef67ff94178953773384871786c272a9197fc6b2",
+    "redaction": "Natural-language task content removed; field structure and capability labels retained",
+    "arguments": {
+      "decision": "candidate",
+      "reason": "Task text redacted; preserve the proposed responsibilities",
+      "next_work": "Task text redacted; preserve the proposed responsibilities",
+      "covered_work_ids": [
+        "scope:main"
+      ],
+      "proposal": {
+        "operation": "delegate",
+        "pattern": "parallel",
+        "reason": "Task text redacted",
+        "proposed_next": "Task text redacted",
+        "expected_savings": "Task text redacted",
+        "risks": "Task text redacted",
+        "handoff": "Task text redacted",
+        "branches": [
+          {
+            "goal": "Read assigned public source and return evidence",
+            "tools": [
+              "spotify.show_playlist",
+              "spotify.show_playlist_library"
+            ],
+            "skills": [
+              "pagination exhaustion",
+              "record extraction"
+            ],
+            "read_only": true,
+            "source_family": "spotify playlists (group A: first half of show_playlist_library results)",
+            "completion_condition": "Read assigned public source and return evidence",
+            "handoff": "Read assigned public source and return evidence"
+          },
+          {
+            "goal": "Read assigned public source and return evidence",
+            "tools": [
+              "spotify.show_playlist",
+              "spotify.show_playlist_library"
+            ],
+            "skills": [
+              "pagination exhaustion",
+              "record extraction"
+            ],
+            "read_only": true,
+            "source_family": "spotify playlists (group B: second half of show_playlist_library results)",
+            "completion_condition": "Read assigned public source and return evidence",
+            "handoff": "Read assigned public source and return evidence"
+          },
+          {
+            "goal": "Read assigned public source and return evidence",
+            "tools": [
+              "spotify.show_liked_songs",
+              "spotify.show_song_library",
+              "spotify.show_song"
+            ],
+            "skills": [
+              "pagination exhaustion",
+              "schema inspection"
+            ],
+            "read_only": true,
+            "source_family": "spotify liked songs and song library",
+            "completion_condition": "Read assigned public source and return evidence",
+            "handoff": "Read assigned public source and return evidence"
+          }
+        ],
+        "approve": false
+      }
+    }
+  },
+  {
+    "kind": "incomplete_nested_proposal",
+    "source_commit": "90f9a35",
+    "source_trace_sha256": "0b5d66d043990ee3db4477cc0916ed22841aee46dd58d2df2f38261d9afa2036",
+    "redaction": "Natural-language task content removed; field structure and capability labels retained",
+    "arguments": {
+      "decision": "candidate",
+      "reason": "Task text redacted; preserve the proposed responsibilities",
+      "next_work": "Task text redacted; preserve the proposed responsibilities",
+      "covered_work_ids": [
+        "scope:main"
+      ],
+      "proposal": {
+        "operation": "delegate",
+        "pattern": "parallel",
+        "reason": "Task text redacted",
+        "expected_savings": "Task text redacted",
+        "risks": "Task text redacted",
+        "handoff": "Task text redacted",
+        "approve": true,
+        "branches": [
+          {
+            "goal": "Read assigned public source and return evidence",
+            "read_only": true,
+            "source_family": "spotify-saved-tracks",
+            "skills": [
+              "spotify_library_read",
+              "pagination"
+            ],
+            "tools": [
+              "spotify_library_read_api"
+            ],
+            "evidence_ids": [],
+            "completion_condition": "Read assigned public source and return evidence",
+            "handoff": "Read assigned public source and return evidence"
+          },
+          {
+            "goal": "Read assigned public source and return evidence",
+            "read_only": true,
+            "source_family": "spotify-saved-albums",
+            "skills": [
+              "spotify_library_read",
+              "pagination"
+            ],
+            "tools": [
+              "spotify_library_read_api"
+            ],
+            "evidence_ids": [],
+            "completion_condition": "Read assigned public source and return evidence",
+            "handoff": "Read assigned public source and return evidence"
+          },
+          {
+            "goal": "Read assigned public source and return evidence",
+            "read_only": true,
+            "source_family": "spotify-playlists",
+            "skills": [
+              "spotify_playlist_read",
+              "pagination"
+            ],
+            "tools": [
+              "spotify_playlist_read_api"
+            ],
+            "evidence_ids": [],
+            "completion_condition": "Read assigned public source and return evidence",
+            "handoff": "Read assigned public source and return evidence"
+          }
+        ]
+      }
+    }
+  }
+]

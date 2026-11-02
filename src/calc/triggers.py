@@ -147,6 +147,7 @@ def control_messages(runtime, actor, state: dict) -> list[dict]:
             'allowed_operations': state['allowed_operations'], 'read_sources': list(actor.read_sources.values()),
             'business_capabilities': runtime.registry.scoped(actor.allowed_tools).catalog(),
             'registered_skills': list(runtime.skills),
+            'last_rejected_decision': actor.scheduling_feedback,
             'binding_rule': 'Branch tools are registered capability names, not underlying API/operation labels. '
                             'Omit tools to inherit scope; omit skills when none is registered. '
                             'Source-family IDs and evidence bindings belong to the runtime compiler.',
